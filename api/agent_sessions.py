@@ -1015,18 +1015,30 @@ def read_fast_sidebar_agent_rows(
         origin_user_id_expr = _optional_col('origin_user_id', session_cols)
         platform_expr = _optional_col('platform', session_cols)
 
-        messages_usable = 'session_id' in message_cols and 'timestamp' in message_cols
-        use_messages_join = messages_usable
+        # Older/minimal schemas can have NO ``messages`` table at all, or a
+        # ``messages`` table without a ``session_id`` / ``timestamp`` column.
+        # Mirror the full reader's degradation exactly (``use_messages_join``
+        # keyed on ``session_id`` alone; ``last_activity``/the display key only
+        # when a ``timestamp`` column exists — see
+        # ``read_importable_agent_session_rows``) so the fast first paint and
+        # the full payload cannot disagree on what a given schema means.
+        messages_has_session_id = 'session_id' in message_cols
+        messages_has_timestamp = 'timestamp' in message_cols
+        use_messages_join = messages_has_session_id
         count_col = 'id' if 'id' in message_cols else 'session_id'
         if use_messages_join:
             actual_count_expr = f"COUNT(m.{count_col})"
-            last_activity_expr = "MAX(m.timestamp)"
+            last_activity_expr = "MAX(m.timestamp)" if messages_has_timestamp else "NULL"
             join_clause = "LEFT JOIN messages m ON m.session_id = s.id"
             group_by_clause = "GROUP BY s.id"
-            display_order_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
+            if messages_has_timestamp:
+                display_order_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
+            else:
+                display_order_clause = "ORDER BY s.started_at DESC"
         else:
-            # Older/minimal schemas without a usable messages table: mirror the
-            # full reader's degradation (denormalized counts, started_at order).
+            # No usable messages table: use the denormalized per-session counts
+            # and ``started_at`` so the rows still surface in the sidebar
+            # (identical to the full reader's no-messages degradation).
             actual_count_expr = "s.message_count"
             last_activity_expr = "NULL"
             join_clause = ""
@@ -1056,11 +1068,11 @@ def read_fast_sidebar_agent_rows(
             where_clauses.append(f"s.id IN ({placeholders})")
             params.extend(wanted_ids)
 
-        if 'last_activity_at' in session_cols:
+        if 'last_activity_at' in session_cols and use_messages_join and messages_has_timestamp:
             candidate_order_clause = (
                 "ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC, s.started_at DESC"
             )
-        elif messages_usable:
+        elif use_messages_join and messages_has_timestamp:
             # Older schemas without the denormalized column: the exact
             # correlated key is the pre-Slice-D candidate ordering.
             candidate_order_clause = (
@@ -1068,6 +1080,8 @@ def read_fast_sidebar_agent_rows(
                 "WHERE mx.session_id = s.id), s.started_at) DESC, s.started_at DESC"
             )
         else:
+            # No usable messages table / no ``timestamp`` column: the full
+            # reader degrades to ``started_at`` here too, so the window matches.
             candidate_order_clause = "ORDER BY s.started_at DESC"
 
         candidate_limit = max(result_limit * FAST_SIDEBAR_CANDIDATE_OVERSAMPLE, result_limit)

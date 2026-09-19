@@ -658,6 +658,102 @@ def test_fast_reader_degrades_without_a_messages_table(monkeypatch, tmp_path):
     assert rows[0]["message_count"] == 3
 
 
+def _make_edge_schema_without_message_timestamps(tmp_path):
+    """state.db with ``messages(session_id, role, content)`` — no ``timestamp``.
+
+    ``edge-hot`` is newest by ``started_at`` but oldest by ``last_activity_at``;
+    20 fillers are the reverse. The full reader's degradation for this schema
+    joins ``messages`` on ``session_id`` alone (``COUNT(m.id)``, ``last_activity
+    = NULL``) and orders candidates by ``started_at``; the fast reader must
+    mirror exactly that.
+    """
+    db_path = tmp_path / "edge.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, title TEXT, model TEXT, "
+        "started_at REAL, message_count INTEGER, last_activity_at REAL, parent_session_id TEXT, "
+        "end_reason TEXT, ended_at REAL)"
+    )
+    conn.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, "
+        "role TEXT, content TEXT)"
+    )
+
+    def _add(sid, title, started, mc, last_activity_at, roles):
+        conn.execute(
+            "INSERT INTO sessions (id, source, title, started_at, message_count, last_activity_at) "
+            "VALUES (?, 'cli', ?, ?, ?, ?)",
+            (sid, title, started, mc, last_activity_at),
+        )
+        for role in roles:
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                (sid, role, f"{sid} {role}"),
+            )
+
+    # stale counter (mc=5) over 2 real messages; candidate-last by last_activity_at
+    _add("edge-hot", "Edge hot", T + 900, 5, T + 10, ("user", "assistant"))
+    # mc=2 over 3 real messages
+    _add("edge-b", "Edge b", T + 800, 2, T + 800, ("user", "assistant", "user"))
+    for i in range(20):
+        _add(f"edge-filler-{i:02d}", f"Edge filler {i:02d}", T + 100 + i, 2, T + 500 + i,
+             ("user", "assistant"))
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def test_fast_reader_mirrors_full_reader_without_message_timestamps(tmp_path):
+    """``messages`` without a ``timestamp`` column: the fast reader must join
+    like the full reader (``session_id`` alone) and report ``COUNT(m.id)``, not
+    the denormalized ``s.message_count``.
+
+    Verifier repro on this schema: fast reported the stale counters (5/2) while
+    the full reader reported the real counts (2/3) — the fast reader gated the
+    JOIN on ``session_id AND timestamp`` while the full reader joins on
+    ``session_id`` alone (``api/agent_sessions.py``).
+    """
+    import api.agent_sessions as agent_sessions
+
+    db_path = _make_edge_schema_without_message_timestamps(tmp_path)
+    fast = agent_sessions.read_fast_sidebar_agent_rows(
+        db_path, limit=20, exclude_sources=("cron", "webhook", "kanban"),
+    )
+    full = agent_sessions.read_importable_agent_session_rows(
+        db_path, limit=20, exclude_sources=("cron", "webhook", "kanban"),
+    )
+    assert [row["id"] for row in fast] == [row["id"] for row in full]
+    assert [row["actual_message_count"] for row in fast] == [
+        row["actual_message_count"] for row in full
+    ]
+    assert [row["last_activity"] for row in fast] == [None] * len(fast)
+    by_id = {row["id"]: row for row in fast}
+    assert by_id["edge-hot"]["actual_message_count"] == 2  # COUNT(m.id), not mc=5
+    assert by_id["edge-b"]["actual_message_count"] == 3    # COUNT(m.id), not mc=2
+
+
+def test_fast_reader_candidate_window_ignores_last_activity_without_timestamps(tmp_path):
+    """Without a ``timestamp`` column the full reader's candidate window orders
+    by ``started_at`` (its documented degradation), so the fast window must too.
+
+    With a ``limit`` small enough that the 8x window binds, a
+    ``COALESCE(last_activity_at, started_at)`` candidate key drops ``edge-hot``
+    (newest by ``started_at``, oldest by ``last_activity_at``) from the window
+    and the visible slice diverges from the full reader's.
+    """
+    import api.agent_sessions as agent_sessions
+
+    db_path = _make_edge_schema_without_message_timestamps(tmp_path)
+    fast = agent_sessions.read_fast_sidebar_agent_rows(
+        db_path, limit=2, exclude_sources=("cron", "webhook", "kanban"),
+    )
+    full = agent_sessions.read_importable_agent_session_rows(
+        db_path, limit=2, exclude_sources=("cron", "webhook", "kanban"),
+    )
+    assert [row["id"] for row in fast] == [row["id"] for row in full]
+    assert [row["id"] for row in fast] == ["edge-hot", "edge-b"]
+
+
 def test_fast_payload_is_bounded_and_fills_user_counts_lazily(monkeypatch, tmp_path):
     """The user-turn fallback query must only cover rows dropped by the
     visibility filter, never the whole candidate window."""
