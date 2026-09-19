@@ -882,6 +882,64 @@ def test_source_stamp_split_treats_session_insert_as_structural(tmp_path, monkey
     assert routes._session_list_cache_stale_reason(key) == "source"
 
 
+def test_source_stamp_split_messages_rowid_backstop_moves_only_the_volatile_part(
+    monkeypatch,
+):
+    """Slice D note 2: the volatile part must carry the ``MAX(rowid) messages``
+    fingerprint element — the commit-reliable backstop for the WAL-mode stat
+    collision documented on ``_session_list_cache_source_stamp``. With every
+    path-stat helper pinned to a constant and only the fingerprint varied, each
+    stamp part must move with its own element: structural with ``MAX(rowid)
+    sessions``, volatile with ``MAX(rowid) messages``.
+
+    This is the only test that pins the messages-rowid element directly: the
+    e2e overlay test and the rest of this file keep passing when it is dropped
+    from the volatile part (verified by mutation), because the state.db/WAL
+    stats still move on a message write.
+    """
+    from api import route_session_list_cache as route_session_list_cache
+
+    # Freeze every non-fingerprint stamp input: all path stats, the settings
+    # write version and the streaming freeze marker.
+    monkeypatch.setattr(
+        route_session_list_cache, "_session_list_cache_path_stamp", lambda _path: ("stat", 0)
+    )
+    monkeypatch.setattr(routes, "_session_list_cache_settings_write_version", lambda: 7)
+    monkeypatch.setattr(routes, "_active_stream_ids", lambda: set())
+
+    fingerprint = {"value": (11, 21)}
+    monkeypatch.setattr(
+        routes,
+        "_session_list_cache_state_db_fingerprint",
+        lambda _path: fingerprint["value"],
+    )
+    key = routes._session_list_cache_key(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+    )
+
+    stamp_a = routes._session_list_cache_source_stamp(key)
+    # The fingerprint elements sit in their documented slots: sessions rowid in
+    # the structural part, messages rowid in the volatile part.
+    assert 11 in stamp_a[0]
+    assert 21 in stamp_a[1]
+
+    # A sessions-rowid-only change moves the STRUCTURAL part, not the volatile.
+    fingerprint["value"] = (12, 21)
+    stamp_b = routes._session_list_cache_source_stamp(key)
+    assert stamp_b[0] != stamp_a[0]
+    assert stamp_b[1] == stamp_a[1]
+
+    # A messages-rowid-only change moves the VOLATILE part, not the structural.
+    fingerprint["value"] = (12, 22)
+    stamp_c = routes._session_list_cache_source_stamp(key)
+    assert stamp_c[0] == stamp_b[0]
+    assert stamp_c[1] != stamp_b[1]
+
+
 def test_source_stamp_split_wal_stat_change_is_volatile_only(tmp_path, monkeypatch):
     """B1: a WAL-stat-only change (fingerprint pinned) is volatile → "age"."""
     key, state_db_wal, _settings_file, _fingerprint = _build_stamp_env(
