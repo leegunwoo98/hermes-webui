@@ -728,6 +728,250 @@ def test_routes_lookup_wrapper_returns_empty_on_models_failure(monkeypatch):
     assert routes._lookup_cli_session_metadata("cli-session") == {}
 
 
+def _make_overflow_child_state_db(path: Path) -> None:
+    """child + parent + 170 newer fillers so the parent falls outside BOTH the
+    bulk candidate oversample (20*8=160) and the 20-row display slice while the
+    child stays in the payload — the reverse-divergence fixture."""
+    _make_chain_state_db(path)
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "INSERT INTO sessions (id, source, session_source, title, model, started_at,"
+        " message_count, parent_session_id, ended_at, end_reason)"
+        " VALUES ('overflow_parent', 'desktop', 'desktop', 'Overflow parent', 'test-model',"
+        " 10.0, 1, NULL, NULL, NULL)"
+    )
+    conn.execute(
+        "INSERT INTO messages (id, session_id, role, content, timestamp)"
+        " VALUES ('msg_overflow_parent_1', 'overflow_parent', 'user', 'hi', 11.0)"
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, session_source, title, model, started_at,"
+        " message_count, parent_session_id, ended_at, end_reason)"
+        " VALUES ('overflow_child', 'desktop', 'desktop', 'Overflow child', 'test-model',"
+        " 1000.0, 1, 'overflow_parent', NULL, NULL)"
+    )
+    conn.execute(
+        "INSERT INTO messages (id, session_id, role, content, timestamp)"
+        " VALUES ('msg_overflow_child_1', 'overflow_child', 'user', 'hi', 1001.0)"
+    )
+    for i in range(170):
+        conn.execute(
+            "INSERT INTO sessions (id, source, session_source, title, model, started_at,"
+            " message_count, parent_session_id, ended_at, end_reason)"
+            " VALUES (?, 'desktop', 'desktop', ?, 'test-model', ?, 1, NULL, NULL, NULL)",
+            (f"filler_{i:03d}", f"Filler {i}", 500.0 + i),
+        )
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, timestamp)"
+            " VALUES (?, ?, 'user', 'hi', ?)",
+            (f"msg_filler_{i:03d}", f"filler_{i:03d}", 500.0 + i),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_lookup_equivalence_matrix_on_chain_fixture(monkeypatch, tmp_path):
+    """A6 gate: for every sid the bulk payload contains, the targeted lookup
+    returns the identical row dict (desktop/webui/kanban/cron/messaging,
+    state.db claude-code, plain parent/child, compression tip, subagent child)."""
+    import api.models as models
+
+    hermes_home = _pin_fixture_environment(monkeypatch, tmp_path)
+    _make_chain_state_db(hermes_home / "state.db")
+
+    bulk = _bulk_rows_by_id(models)
+    assert set(bulk) >= {
+        "tip_compression",
+        "parent_plain",
+        "child_plain",
+        "sa_parent",
+        "sa_child",
+        "desktop_row",
+        "webui_row",
+        "kanban_row",
+        "cron_jobchain_1",
+        "telegram_row",
+        "20260919_115234_32234b",
+    }
+
+    for sid, bulk_row in bulk.items():
+        assert models.lookup_cli_session_metadata(sid) == bulk_row, f"lookup drifted for {sid}"
+
+
+def test_lookup_tombstoned_webui_row_returns_empty(monkeypatch, tmp_path):
+    """A6: a tombstoned WebUI row is omitted from the bulk payload AND resolves
+    to {} through the lookup (the loader drops it on both paths)."""
+    import api.models as models
+
+    hermes_home = _pin_fixture_environment(monkeypatch, tmp_path)
+    _make_chain_state_db(hermes_home / "state.db")
+    monkeypatch.setattr(
+        models, "_load_webui_deleted_session_tombstone", lambda: frozenset({"webui_row"})
+    )
+
+    bulk_ids = set(_bulk_rows_by_id(models))
+    assert "webui_row" not in bulk_ids
+
+    assert models.lookup_cli_session_metadata("webui_row") == {}
+
+
+def test_lookup_claude_code_jsonl_family_matches_bulk(monkeypatch, tmp_path):
+    """A6: the JSONL claude_code_* family resolves through A5 with the same
+    fields the bulk scan produces (both claude families covered: this test plus
+    the state.db claude-code row in the equivalence matrix)."""
+    import api.models as models
+    import api.profiles as profiles
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    _make_chain_state_db(hermes_home / "state.db")
+    projects_dir = tmp_path / "claude" / "projects"
+    fixture = projects_dir / "project-a" / "session.jsonl"
+    _write_claude_jsonl(fixture, [
+        {"summary": "Claude Code equivalence"},
+        {"timestamp": "2026-04-18T12:00:01Z", "message": {"role": "user", "content": "hello"}},
+        {"timestamp": "2026-04-18T12:00:02Z", "message": {"role": "assistant", "content": "hi"}},
+    ])
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: str(hermes_home))
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(models, "get_last_workspace", lambda: tmp_path)
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(models.Session, "load_metadata_only", lambda _sid: None)
+    monkeypatch.setattr(models, "_profile_has_user_projects", lambda: False)
+    monkeypatch.setattr(models, "ensure_cron_project", lambda **_: "cron-project-id")
+    monkeypatch.setattr(models, "ensure_webhook_project", lambda: "webhook-project-id")
+    monkeypatch.setenv("HERMES_WEBUI_CLAUDE_PROJECTS_DIR", str(projects_dir))
+    models.clear_cli_sessions_cache()
+
+    sid = models._claude_code_session_id(fixture)
+    bulk = _bulk_rows_by_id(models)
+    assert sid in bulk
+
+    row = models.lookup_cli_session_metadata(sid)
+
+    assert row == bulk[sid]
+    assert row["source_tag"] == "claude_code"
+    assert row["read_only"] is True
+    assert row["profile"] is None
+
+
+def test_lookup_all_profiles_keeps_context_merge_order(monkeypatch, tmp_path):
+    """A6: all_profiles iterates profile contexts in the same order
+    get_cli_sessions merges them, so first-match semantics are preserved."""
+    import api.models as models
+
+    hermes_home = _pin_fixture_environment(monkeypatch, tmp_path)
+    home_a = hermes_home
+    home_b = tmp_path / "profile-b"
+    home_b.mkdir()
+    _make_multi_source_state_db(home_a / "state.db")
+    _make_multi_source_state_db(home_b / "state.db")
+    conn = sqlite3.connect(str(home_b / "state.db"))
+    conn.execute(
+        "INSERT INTO sessions (id, source, session_source, title, model, started_at,"
+        " message_count) VALUES ('profile_b_row', 'tui', 'tui', 'B row', 'test-model', 5.0, 1)"
+    )
+    conn.execute(
+        "INSERT INTO messages (id, session_id, role, content, timestamp)"
+        " VALUES ('msg_b_1', 'profile_b_row', 'user', 'hi', 5.0)"
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(
+        models,
+        "_all_profiles_cli_contexts",
+        lambda: (
+            [
+                (home_a, home_a / "state.db", "default"),
+                (home_b, home_b / "state.db", "profileb"),
+            ],
+            (),
+        ),
+    )
+
+    row_b = models.lookup_cli_session_metadata("profile_b_row", all_profiles=True)
+    assert row_b["session_id"] == "profile_b_row"
+    assert row_b["profile"] == "profileb"
+
+    row_a = models.lookup_cli_session_metadata("tui_session", all_profiles=True)
+    assert row_a["session_id"] == "tui_session"
+    assert row_a["profile"] == "default"
+
+
+def test_lookup_guard_never_rebuilds_bulk_scans(monkeypatch, tmp_path):
+    """A6 guard: the lookup must not call get_cli_sessions (full projection) or
+    get_claude_code_sessions (JSONL scan) — patched to raise."""
+    import api.models as models
+
+    hermes_home = _pin_fixture_environment(monkeypatch, tmp_path)
+    _make_chain_state_db(hermes_home / "state.db")
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("targeted lookup must not rebuild the bulk projection")
+
+    monkeypatch.setattr(models, "get_cli_sessions", boom)
+    monkeypatch.setattr(models, "get_claude_code_sessions", boom)
+
+    row = models.lookup_cli_session_metadata("telegram_row")
+
+    assert row["session_id"] == "telegram_row"
+    assert row["source_tag"] == "telegram"
+
+
+def test_lookup_guard_claude_code_sid_resolves_without_bulk_scan(monkeypatch, tmp_path):
+    """A6 guard: a claude_code_* sid still resolves via the targeted JSONL walk
+    while both bulk scans are patched to raise."""
+    import api.models as models
+
+    hermes_home = _pin_fixture_environment(monkeypatch, tmp_path)
+    _make_chain_state_db(hermes_home / "state.db")
+    projects_dir = tmp_path / "claude" / "projects"
+    fixture = projects_dir / "project-a" / "guarded.jsonl"
+    _write_claude_jsonl(fixture, [
+        {"message": {"role": "user", "content": "guarded"}},
+    ])
+    monkeypatch.setenv("HERMES_WEBUI_CLAUDE_PROJECTS_DIR", str(projects_dir))
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("targeted lookup must not rebuild the bulk projection")
+
+    monkeypatch.setattr(models, "get_cli_sessions", boom)
+    monkeypatch.setattr(models, "get_claude_code_sessions", boom)
+
+    sid = models._claude_code_session_id(fixture)
+    row = models.lookup_cli_session_metadata(sid)
+
+    assert row["session_id"] == sid
+    assert row["read_only"] is True
+    assert row["session_source"] == "external_agent"
+    assert row["source_label"] == "Claude Code"
+
+
+def test_lookup_child_with_parent_outside_window_adds_parent_metadata(monkeypatch, tmp_path):
+    """A6 documented divergence (fidelity improvement): when the bulk 20-row
+    window drops the parent, the bulk child row has parent_title=None while the
+    chain-aware lookup still resolves it. Everything else must match."""
+    import api.models as models
+
+    hermes_home = _pin_fixture_environment(monkeypatch, tmp_path)
+    _make_overflow_child_state_db(hermes_home / "state.db")
+
+    bulk = _bulk_rows_by_id(models)
+    assert "overflow_child" in bulk
+    assert "overflow_parent" not in bulk
+    assert bulk["overflow_child"]["parent_title"] is None
+
+    row = models.lookup_cli_session_metadata("overflow_child")
+
+    assert row["parent_title"] == "Overflow parent"
+    assert row["parent_source"] == "desktop"
+    ignored = {"parent_title", "parent_source"}
+    assert {k: v for k, v in row.items() if k not in ignored} == {
+        k: v for k, v in bulk["overflow_child"].items() if k not in ignored
+    }
+
+
 class _FakeSession:
     def __init__(self, *, is_cli_session=False, session_source=None, source_tag=None):
         self.session_id = "native_webui_001"
