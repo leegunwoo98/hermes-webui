@@ -7875,7 +7875,7 @@ def _build_cli_session_row(
         'session_id': sid,
         'title': _title or default_title,
         'workspace': workspace,
-        'model': row.get('model') or None,
+        'model': row['model'] or None,
         'message_count': row.get('message_count') or row.get('actual_message_count') or 0,
         'created_at': row.get('started_at'),
         'updated_at': row.get('last_activity') or row.get('started_at'),
