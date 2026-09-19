@@ -3021,12 +3021,75 @@ def _hidden_archived_sidebar_reference_sessions(
     return references
 
 
+def _start_session_list_cache_background_rebuild(key: tuple, event, builder) -> None:
+    """Build ``builder()`` on a daemon thread and store it under ``key``.
+
+    Hoisted out of ``_get_cached_session_list_payload``'s stale branch (Slice C)
+    so the fast first-paint path can reuse it verbatim. ``_session_list_cache_done``
+    fires ONLY from this thread's ``finally``: handing the claimed rebuild event
+    here is what keeps waiters from being released with no fresh payload (they
+    would otherwise fall into the synchronous safety rebuild).
+    """
+
+    def _rebuild_session_list_cache():
+        try:
+            rebuild_attempts = 0
+            while True:
+                invalidation_stamp = _session_list_cache_invalidation_stamp(key)
+                try:
+                    payload = builder()
+                except Exception:
+                    logger.exception(
+                        "session list stale-cache background rebuild failed"
+                    )
+                    return
+                if (
+                    _session_list_cache_invalidation_stamp(key) == invalidation_stamp
+                    and _session_list_cache_set(
+                        key,
+                        payload,
+                        expected_invalidation_stamp=invalidation_stamp,
+                    )
+                ):
+                    return
+                rebuild_attempts += 1
+                if rebuild_attempts >= 3:
+                    return
+        finally:
+            _session_list_cache_done(key, event)
+
+    try:
+        thread = threading.Thread(
+            target=_rebuild_session_list_cache,
+            name="session-list-cache-rebuild",
+            daemon=True,
+        )
+        thread.start()
+    except Exception:
+        _session_list_cache_done(key, event)
+
+
 def _get_cached_session_list_payload(
     *,
     key: tuple,
     builder,
     diag=None,
+    fast_builder=None,
 ) -> dict:
+    """Return the cached session-list payload, rebuilding when needed.
+
+    ``fast_builder`` (Slice C) enables the fast first-paint path: on a COLD
+    cache miss (no entry at all) the bounded fast payload is served while
+    ``builder`` — the full payload — rebuilds on a daemon thread. Both the
+    claiming owner and a concurrent non-owner serve the fast payload, so a cold
+    burst never waits out the 0.25 s owner window nor rebuilds synchronously.
+    The fast payload is never stored; only the full rebuild writes the cache.
+
+    With ``fast_builder=None`` (every non-default request shape, and focused
+    tests that call this helper directly) behavior is unchanged — including the
+    structural ("source") stale path, which must rebuild synchronously
+    (commit 47d8ac94) and deliberately keeps the full builder.
+    """
     if diag is not None:
         try:
             diag.stage("session_list_cache_lookup")
@@ -3052,49 +3115,40 @@ def _get_cached_session_list_payload(
                     diag.stage("session_list_cache_stale_background_rebuild")
                 except Exception:
                     pass
-
-            def _rebuild_stale_session_list_cache():
-                try:
-                    rebuild_attempts = 0
-                    while True:
-                        invalidation_stamp = _session_list_cache_invalidation_stamp(key)
-                        try:
-                            payload = builder()
-                        except Exception:
-                            logger.exception(
-                                "session list stale-cache background rebuild failed"
-                            )
-                            return
-                        if (
-                            _session_list_cache_invalidation_stamp(key) == invalidation_stamp
-                            and _session_list_cache_set(
-                                key,
-                                payload,
-                                expected_invalidation_stamp=invalidation_stamp,
-                            )
-                        ):
-                            return
-                        rebuild_attempts += 1
-                        if rebuild_attempts >= 3:
-                            return
-                finally:
-                    _session_list_cache_done(key, event)
-
-            try:
-                thread = threading.Thread(
-                    target=_rebuild_stale_session_list_cache,
-                    name="session-list-cache-rebuild",
-                    daemon=True,
-                )
-                thread.start()
-            except Exception:
-                _session_list_cache_done(key, event)
+            _start_session_list_cache_background_rebuild(key, event, builder)
         elif diag is not None:
             try:
                 diag.stage("session_list_cache_stale_return")
             except Exception:
                 pass
         return stale
+
+    if stale is None and fast_builder is not None:
+        # Cold cache miss on the fast-gated shape: serve the bounded first-paint
+        # payload and let the full builder rebuild in the background. The fast
+        # payload is built BEFORE the rebuild event is claimed so a fast-build
+        # failure falls through to the unchanged synchronous path below.
+        fast_payload = None
+        try:
+            fast_payload = fast_builder()
+        except Exception:
+            logger.exception(
+                "session list fast-path build failed; falling back to the full builder"
+            )
+        if fast_payload is not None:
+            event, is_owner = _session_list_cache_claim_rebuild(key)
+            if diag is not None:
+                try:
+                    diag.stage(
+                        "session_list_cache_fast_owner"
+                        if is_owner
+                        else "session_list_cache_fast_follower"
+                    )
+                except Exception:
+                    pass
+            if is_owner:
+                _start_session_list_cache_background_rebuild(key, event, builder)
+            return fast_payload
 
     event, is_owner = _session_list_cache_claim_rebuild(key)
     if is_owner:
@@ -14521,6 +14575,40 @@ def handle_get(handler, parsed) -> bool:
             # heavy lifting now lives in the cache builder: profile scoping via
             # `_profiles_match(s.get("profile"), active_profile)` still happens
             # before `_keep_latest_messaging_session_per_source(`.
+            #
+            # Slice C: the default sidebar shape (visible_only, no archive
+            # paging, no background source filter, single profile) also gets a
+            # fast first-paint builder. It is served only on a cold cache miss
+            # while the full builder below rebuilds in the background; archive/
+            # paged/background-source/all-profiles shapes keep the full builder
+            # synchronously.
+            fast_builder = None
+            if _session_list_fast_shape_eligible(
+                all_profiles=all_profiles,
+                visible_only=True,
+                include_archived=include_archived,
+                archived_limit=archived_limit,
+                source_filter=agent_session_source_filter,
+                sidebar_source=sidebar_source,
+            ):
+                fast_builder = lambda: _build_session_list_fast_payload(  # noqa: E731
+                    active_profile=active_profile,
+                    all_profiles=all_profiles,
+                    show_cli_sessions=show_cli_sessions,
+                    show_claude_code_sessions=show_claude_code_sessions,
+                    show_previous_messaging_sessions=show_previous_messaging_sessions,
+                    show_cron_sessions=show_cron_sessions,
+                    include_archived=include_archived,
+                    exclude_hidden=exclude_hidden,
+                    visible_only=True,
+                    show_webhook_sessions=show_webhook_sessions,
+                    show_kanban_sessions=show_kanban_sessions,
+                    source_filter=agent_session_source_filter,
+                    sidebar_source=sidebar_source,
+                    archived_limit=archived_limit,
+                    archived_offset=archived_offset,
+                    diag=diag,
+                )
             payload = _get_cached_session_list_payload(
                 key=key,
                 builder=lambda: _build_session_list_cache_payload(
@@ -14541,6 +14629,7 @@ def handle_get(handler, parsed) -> bool:
                     archived_offset=archived_offset,
                     diag=diag,
                 ),
+                fast_builder=fast_builder,
                 diag=diag,
             )
             diag.stage("response_write")

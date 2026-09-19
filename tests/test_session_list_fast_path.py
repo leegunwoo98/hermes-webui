@@ -463,3 +463,228 @@ def test_fast_payload_is_bounded_and_fills_user_counts_lazily(monkeypatch, tmp_p
     for sql in user_count_sql:
         assert "session_id IN" in sql, f"user-count fallback must be id-bounded: {sql[:200]}"
         assert "GROUP BY" in sql
+
+
+# ── C2: cache wiring ─────────────────────────────────────────────────────────
+
+def _cache_payload(marker, **extra):
+    payload = {"sessions": [{"session_id": marker}], "cli_count": 0, "active_profile": None}
+    payload.update(extra)
+    return payload
+
+
+def _cache_key():
+    return routes._session_list_cache_key(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_session_list_cache_state():
+    routes._session_list_cache_clear()
+    with routes._SESSIONS_CACHE_LOCK:
+        routes._SESSIONS_CACHE_INFLIGHT.clear()
+    yield
+    routes._session_list_cache_clear()
+    with routes._SESSIONS_CACHE_LOCK:
+        routes._SESSIONS_CACHE_INFLIGHT.clear()
+
+
+def test_cold_owner_serves_fast_payload_and_rebuilds_full_in_background(monkeypatch):
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
+    key = _cache_key()
+    started = threading.Event()
+    release = threading.Event()
+    calls = {"full": 0, "fast": 0}
+
+    def _full_builder():
+        calls["full"] += 1
+        started.set()
+        release.wait(5.0)
+        return _cache_payload("full")
+
+    def _fast_builder():
+        calls["fast"] += 1
+        return _cache_payload("fast")
+
+    result = routes._get_cached_session_list_payload(
+        key=key, builder=_full_builder, fast_builder=_fast_builder,
+    )
+    assert result == _cache_payload("fast")
+    assert calls == {"full": 1, "fast": 1}
+    assert started.wait(1.0), "the full rebuild must run in the background"
+
+    # The fast payload is NOT stored and the rebuild event is still pending, so
+    # waiters cannot be released with no fresh payload.
+    assert routes._session_list_cache_get(key, allow_stale=True) == (None, False)
+    with routes._SESSIONS_CACHE_LOCK:
+        event = routes._SESSIONS_CACHE_INFLIGHT.get(key)
+    assert event is not None and not event.is_set()
+
+    release.set()
+    deadline = time.monotonic() + 5.0
+    stored = None
+    while time.monotonic() < deadline:
+        stored, _fresh = routes._session_list_cache_get(key, allow_stale=True)
+        if stored is not None:
+            break
+        time.sleep(0.02)
+    assert stored == _cache_payload("full")
+    assert calls == {"full": 1, "fast": 1}
+
+
+def test_cold_follower_serves_fast_payload_without_waiting_for_owner(monkeypatch):
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
+    key = _cache_key()
+    started = threading.Event()
+    release = threading.Event()
+
+    def _full_builder():
+        started.set()
+        release.wait(5.0)
+        return _cache_payload("full")
+
+    owner_result = {}
+
+    def _owner():
+        owner_result["payload"] = routes._get_cached_session_list_payload(
+            key=key,
+            builder=_full_builder,
+            fast_builder=lambda: _cache_payload("fast"),
+        )
+
+    owner = threading.Thread(target=_owner)
+    owner.start()
+    try:
+        assert started.wait(1.0)
+        # The owner's full rebuild is inflight and blocked. A concurrent cold
+        # request must return the fast payload instead of waiting 0.25 s and
+        # rebuilding synchronously.
+        follower = routes._get_cached_session_list_payload(
+            key=key,
+            builder=_full_builder,
+            fast_builder=lambda: _cache_payload("fast"),
+        )
+        assert follower == _cache_payload("fast")
+        assert not release.is_set(), "follower must not block on the owner's rebuild"
+    finally:
+        release.set()
+        owner.join(5.0)
+    assert owner_result["payload"] == _cache_payload("fast")
+
+
+def test_cold_call_without_fast_builder_keeps_synchronous_rebuild(monkeypatch):
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
+    key = _cache_key()
+    calls = []
+
+    def _builder():
+        calls.append("full")
+        return _cache_payload("full")
+
+    assert routes._get_cached_session_list_payload(key=key, builder=_builder) == _cache_payload("full")
+    assert calls == ["full"]
+
+
+def test_fast_builder_failure_falls_back_to_the_synchronous_full_build(monkeypatch):
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
+    key = _cache_key()
+    calls = []
+
+    def _boom():
+        raise RuntimeError("fast build failed")
+
+    def _builder():
+        calls.append("full")
+        return _cache_payload("full")
+
+    result = routes._get_cached_session_list_payload(
+        key=key, builder=_builder, fast_builder=_boom,
+    )
+    assert result == _cache_payload("full")
+    assert calls == ["full"]
+    assert routes._session_list_cache_get(key, allow_stale=True)[0] == _cache_payload("full")
+
+
+@pytest.mark.parametrize("overrides,eligible", [
+    ({}, True),
+    ({"sidebar_source": "webui"}, True),
+    ({"sidebar_source": "cli"}, True),
+    ({"all_profiles": True}, False),
+    ({"include_archived": True}, False),
+    ({"archived_limit": 50}, False),
+    ({"source_filter": "cron"}, False),
+    ({"visible_only": False}, False),
+    ({"sidebar_source": "cron"}, False),
+])
+def test_fast_shape_gate(overrides, eligible):
+    """The gate is about the request SHAPE only: exclude_hidden and the
+    show_* settings flags do not change eligibility (parity is asserted for
+    those shapes in the payload parity test)."""
+    args = dict(
+        all_profiles=False,
+        visible_only=True,
+        include_archived=False,
+        archived_limit=None,
+        source_filter=None,
+        sidebar_source=None,
+    )
+    args.update(overrides)
+    assert routes._session_list_fast_shape_eligible(**args) is eligible
+
+
+def test_sessions_route_serves_fast_payload_only_for_default_shape(monkeypatch, tmp_path):
+    from urllib.parse import urlparse
+
+    class _GetHandler:
+        def __init__(self, path):
+            self.path = path
+            self.headers = {}
+            self.client_address = ("127.0.0.1", 12345)
+            self.status = None
+            from io import BytesIO
+
+            self.wfile = BytesIO()
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, key, value):
+            pass
+
+        def end_headers(self):
+            pass
+
+        @property
+        def response_json(self):
+            return json.loads(self.wfile.getvalue().decode("utf-8"))
+
+    _install_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(routes, "load_settings", lambda: json.loads(
+        (tmp_path / "webui" / "settings.json").read_text(encoding="utf-8")
+    ))
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
+
+    fast_calls = []
+
+    def _fast_builder(**kwargs):
+        fast_calls.append(kwargs)
+        return _cache_payload("fast", webui_session_count=1, cli_session_count=0)
+
+    monkeypatch.setattr(routes, "_build_session_list_fast_payload", _fast_builder)
+
+    default = _GetHandler("/api/sessions?sidebar_source=webui&exclude_hidden=1")
+    routes.handle_get(default, urlparse(default.path))
+    assert default.status == 200
+    assert [r["session_id"] for r in default.response_json["sessions"]] == ["fast"]
+    assert len(fast_calls) == 1
+
+    archive = _GetHandler("/api/sessions?sidebar_source=webui&include_archived=1&archived_limit=50")
+    routes.handle_get(archive, urlparse(archive.path))
+    assert archive.status == 200
+    assert [r["session_id"] for r in archive.response_json["sessions"]] != ["fast"]
+    assert len(fast_calls) == 1, "archive/paged shapes must keep the full builder"
