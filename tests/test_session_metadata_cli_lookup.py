@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlparse
+import json
 import sqlite3
 from pathlib import Path
 
@@ -390,6 +391,75 @@ def test_row_builder_characterization_sidecar_metadata_overrides_title_and_archi
     assert len(rows) == 1
     assert rows[0]["title"] == "Sidecar Title"
     assert rows[0]["archived"] is True
+
+
+def _write_claude_jsonl(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+
+def test_lookup_claude_code_session_row_matches_bulk_row_fields(monkeypatch, tmp_path):
+    """A5: the single-sid JSONL lookup reproduces every bulk row field."""
+    import api.models as models
+
+    projects_dir = tmp_path / "claude" / "projects"
+    fixture = projects_dir / "project-a" / "session.jsonl"
+    _write_claude_jsonl(fixture, [
+        {"summary": "Claude Code lookup QA"},
+        {"timestamp": "2026-04-18T12:00:01Z", "message": {"role": "user", "content": "hello"}},
+        {"timestamp": "2026-04-18T12:00:02Z", "message": {"role": "assistant", "content": "hi"}},
+    ])
+    no_ts_fixture = projects_dir / "project-a" / "no-timestamps.jsonl"
+    _write_claude_jsonl(no_ts_fixture, [
+        {"message": {"role": "user", "content": "no timestamps"}},
+    ])
+    monkeypatch.setattr(models, "get_last_workspace", lambda: tmp_path / "workspace")
+
+    bulk = {row["session_id"]: row for row in models.get_claude_code_sessions(projects_dir=projects_dir)}
+    assert len(bulk) == 2
+
+    for path in (fixture, no_ts_fixture):
+        sid = models._claude_code_session_id(path)
+        row = models._lookup_claude_code_session_row(sid, projects_dir=projects_dir)
+        assert row == bulk[sid], f"field drift for {path.name}"
+
+
+def test_lookup_claude_code_session_row_skips_message_less_files(monkeypatch, tmp_path):
+    """A5: a file whose parse yields no messages stays missing (bulk skips it)."""
+    import api.models as models
+
+    projects_dir = tmp_path / "claude" / "projects"
+    fixture = projects_dir / "project-a" / "summary-only.jsonl"
+    _write_claude_jsonl(fixture, [{"summary": "No messages here"}])
+    monkeypatch.setattr(models, "get_last_workspace", lambda: tmp_path)
+
+    sid = models._claude_code_session_id(fixture)
+    assert models.get_claude_code_sessions(projects_dir=projects_dir) == []
+    assert models._lookup_claude_code_session_row(sid, projects_dir=projects_dir) == {}
+
+
+def test_lookup_claude_code_session_row_early_exits_on_matching_file(monkeypatch, tmp_path):
+    import api.models as models
+
+    projects_dir = tmp_path / "claude" / "projects"
+    first = projects_dir / "project-a" / "a.jsonl"
+    second = projects_dir / "project-b" / "b.jsonl"
+    _write_claude_jsonl(first, [{"message": {"role": "user", "content": "first"}}])
+    _write_claude_jsonl(second, [{"message": {"role": "user", "content": "second"}}])
+    monkeypatch.setattr(models, "get_last_workspace", lambda: tmp_path)
+
+    row = models._lookup_claude_code_session_row(
+        models._claude_code_session_id(second), projects_dir=projects_dir
+    )
+    assert row["title"] == "second"
+    assert row["read_only"] is True
+    assert row["profile"] is None
+    assert row["source_tag"] == "claude_code"
+    assert row["session_source"] == "external_agent"
+    assert row["source_label"] == "Claude Code"
+
+    assert models._lookup_claude_code_session_row("claude_code_missing", projects_dir=projects_dir) == {}
+    assert models._lookup_claude_code_session_row("not_a_claude_sid", projects_dir=projects_dir) == {}
 
 
 class _FakeSession:

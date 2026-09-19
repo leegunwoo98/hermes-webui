@@ -7196,6 +7196,59 @@ def get_claude_code_sessions(projects_dir: Path | str | None = None, *, max_file
     return sessions
 
 
+def _lookup_claude_code_session_row(sid: str, *, projects_dir: Path | str | None = None) -> dict:
+    """Return the single Claude Code JSONL session row for ``sid``, or ``{}``.
+
+    Targeted equivalent of ``get_claude_code_sessions()``: walk the same
+    iterator and early-exit on the file whose hash-derived id matches instead of
+    parsing every transcript. Field-for-field parity with the bulk row is pinned
+    by tests, including the no-message skip (a file whose parse yields no
+    messages produces no row) and the ``first_ts or last_ts or mtime``
+    timestamp fallback.
+    """
+    sid = str(sid or '')
+    if not sid.startswith(f'{CLAUDE_CODE_SOURCE}_'):
+        return {}
+    for path in _iter_claude_code_jsonl_files(projects_dir) or []:
+        if _claude_code_session_id(path) != sid:
+            continue
+        messages, summary_title, first_ts, last_ts = _parse_claude_code_jsonl_cached(path)
+        if not messages:
+            return {}
+        # Match the truthiness fallback used by get_claude_code_sessions(): a
+        # falsy-but-not-None first/last timestamp still falls back to mtime.
+        if not first_ts and not last_ts:
+            try:
+                _mtime = path.stat().st_mtime
+            except OSError:
+                _mtime = 0.0
+        else:
+            _mtime = None
+        created_at = first_ts or last_ts or _mtime
+        updated_at = last_ts or first_ts or _mtime
+        return {
+            'session_id': sid,
+            'title': _claude_code_title(messages, summary_title),
+            'workspace': str(get_last_workspace()),
+            'model': 'claude-code',
+            'message_count': len(messages),
+            'created_at': created_at,
+            'updated_at': updated_at,
+            'last_message_at': updated_at,
+            'pinned': False,
+            'archived': False,
+            'project_id': None,
+            'profile': None,
+            'source_tag': CLAUDE_CODE_SOURCE,
+            'raw_source': CLAUDE_CODE_SOURCE,
+            'session_source': 'external_agent',
+            'source_label': CLAUDE_CODE_SOURCE_LABEL,
+            'is_cli_session': True,
+            'read_only': True,
+        }
+    return {}
+
+
 def get_claude_code_session_messages(sid, projects_dir: Path | str | None = None) -> list:
     """Return messages for one read-only Claude Code JSONL session."""
     sid = str(sid or '')
