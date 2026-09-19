@@ -1,6 +1,119 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlparse
+import sqlite3
+from pathlib import Path
+
+
+def _make_multi_source_state_db(path: Path) -> None:
+    """state.db with three sessions across sources (tui/desktop/telegram)."""
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT,
+            session_source TEXT,
+            title TEXT,
+            model TEXT,
+            started_at REAL NOT NULL,
+            message_count INTEGER DEFAULT 0,
+            parent_session_id TEXT,
+            ended_at REAL,
+            end_reason TEXT,
+            user_id TEXT,
+            chat_id TEXT,
+            chat_type TEXT,
+            thread_id TEXT,
+            session_key TEXT,
+            platform TEXT
+        );
+        CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT,
+            role TEXT,
+            content TEXT,
+            timestamp REAL
+        );
+        CREATE INDEX idx_messages_session ON messages(session_id, timestamp);
+        """
+    )
+    rows = [
+        ("tui_session", "tui", "tui", "TUI Session", 30.0),
+        ("desktop_session", "desktop", "desktop", "Desktop Session", 20.0),
+        ("telegram_session", "telegram", "messaging", "Telegram Session", 10.0),
+    ]
+    for sid, source, session_source, title, started_at in rows:
+        conn.execute(
+            "INSERT INTO sessions (id, source, session_source, title, model, started_at,"
+            " message_count, parent_session_id, ended_at, end_reason, user_id, chat_id,"
+            " chat_type, thread_id, session_key, platform)"
+            " VALUES (?, ?, ?, ?, 'test-model', ?, 1, NULL, NULL, NULL, NULL, NULL,"
+            " NULL, NULL, NULL, NULL)",
+            (sid, source, session_source, title, started_at),
+        )
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, timestamp)"
+            " VALUES (?, ?, 'user', 'hello', ?)",
+            (f"msg_{sid}", sid, started_at),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_read_importable_rows_filters_to_requested_session_ids(tmp_path):
+    """A1: session_ids narrows the read to the requested rows only."""
+    from api.agent_sessions import read_importable_agent_session_rows
+
+    db = tmp_path / "state.db"
+    _make_multi_source_state_db(db)
+
+    bulk = read_importable_agent_session_rows(db, exclude_sources=None)
+    bulk_by_id = {row["id"]: row for row in bulk}
+    assert set(bulk_by_id) == {"tui_session", "desktop_session", "telegram_session"}
+
+    single = read_importable_agent_session_rows(
+        db, exclude_sources=None, session_ids=("tui_session",)
+    )
+
+    assert [row["id"] for row in single] == ["tui_session"]
+    assert single[0] == bulk_by_id["tui_session"]
+
+
+def test_read_importable_rows_session_ids_returns_nothing_when_absent(tmp_path):
+    from api.agent_sessions import read_importable_agent_session_rows
+
+    db = tmp_path / "state.db"
+    _make_multi_source_state_db(db)
+
+    assert read_importable_agent_session_rows(
+        db, exclude_sources=None, session_ids=("missing_session",)
+    ) == []
+    assert read_importable_agent_session_rows(
+        db, exclude_sources=None, session_ids=()
+    ) == []
+
+
+def test_read_importable_rows_session_ids_beats_recency_window(tmp_path):
+    """The id filter is a WHERE clause, so it wins over the candidate slice.
+
+    This is the property the targeted single-session lookup relies on: the
+    single-id read goes through the same candidate-CTE branch as the bulk read
+    (no limit bypass) and still returns the requested row even when it is far
+    outside the recency window.
+    """
+    from api.agent_sessions import read_importable_agent_session_rows
+
+    db = tmp_path / "state.db"
+    _make_multi_source_state_db(db)
+
+    newest = read_importable_agent_session_rows(db, limit=1, exclude_sources=None)
+    assert [row["id"] for row in newest] == ["tui_session"]
+
+    oldest = read_importable_agent_session_rows(
+        db, limit=1, exclude_sources=None, session_ids=("telegram_session",)
+    )
+    assert [row["id"] for row in oldest] == ["telegram_session"]
 
 
 class _FakeSession:

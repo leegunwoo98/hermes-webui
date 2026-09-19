@@ -514,6 +514,7 @@ def read_importable_agent_session_rows(
     log=None,
     exclude_sources: tuple[str, ...] | None = ("cron", "webui"),
     include_sources: tuple[str, ...] | None = None,
+    session_ids: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Return agent sessions projected as importable conversations.
 
@@ -543,6 +544,15 @@ def read_importable_agent_session_rows(
     oversample stays unresolved and its children render top-level, exactly as
     they did before. Widening that window is a ``candidate_limit`` change, not
     a change to this walk.
+
+    ``session_ids`` narrows the read to a targeted set of ids (the targeted
+    single-session metadata lookup in ``api/models.py``): it is appended to the
+    WHERE clause, so it composes with the include/exclude source filters and
+    wins over the recency slice — the requested ids are returned even when they
+    are far outside the candidate window. Passing an empty tuple matches
+    nothing. The read still goes through the candidate-CTE branch (the id set is
+    the candidate set; there is no limit bypass), and the subagent-parent
+    re-add below applies unchanged.
     """
     db_path = Path(db_path)
     if not db_path.exists():
@@ -678,6 +688,17 @@ def read_importable_agent_session_rows(
                 placeholders = ", ".join("?" for _ in excluded)
                 where_clauses.append(f"s.source NOT IN ({placeholders})")
                 params.extend(excluded)
+        if session_ids is not None:
+            # Targeted read: bound the query to the requested ids. Appended last
+            # so the include/exclude params stay in their original order in both
+            # the candidate-CTE branch ([*params, candidate_limit]) and the
+            # unbounded branch (params).
+            wanted_ids = tuple(str(sid).strip() for sid in session_ids if str(sid or "").strip())
+            if not wanted_ids:
+                return []
+            placeholders = ", ".join("?" for _ in wanted_ids)
+            where_clauses.append(f"s.id IN ({placeholders})")
+            params.extend(wanted_ids)
 
         use_preaggregated_candidate_order = (
             use_messages_join
