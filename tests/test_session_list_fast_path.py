@@ -418,6 +418,70 @@ def test_fast_payload_parity_binds_the_candidate_window(monkeypatch, tmp_path):
     assert "filler-000" not in ids
 
 
+def test_fast_payload_shows_the_tier1_state_db_count_override(monkeypatch, tmp_path):
+    """The fast first paint must apply the tier-1 state.db overlay: a webui
+    row's own count (``sessions.message_count``) beats its sidecar.
+
+    On the committed fixture the fast payload is byte-identical with the whole
+    overlay skipped, so nothing pinned the tier-1 fetch; the settled background
+    rebuild (which runs the tier-2 ``messages`` aggregation too) hides the gap
+    in every other test. Here the state.db row has 5 messages while the sidecar
+    has 2 with an older ``last_message_at``:
+
+    * the fast payload must show the state.db count (5), not the sidecar's 2;
+    * the fast builder must ask ``all_sessions`` for tier-1 only
+      (``state_db_override_counts=False``) — no ``messages`` scan on the
+      request thread;
+    * the newer ``last_message_at`` stays a documented divergence: the fast
+      paint carries the sidecar's T+2405, the settled full payload T+2600.
+    """
+    extra_sessions = [(
+        "webui-desktop-appended", "webui", "Desktop appended", T + 2300, None, None, None, 5, {},
+        [("user", T + 2300), ("assistant", T + 2400), ("user", T + 2450),
+         ("assistant", T + 2550), ("user", T + 2600)],
+    )]
+    extra_sidecars = [(
+        "webui-desktop-appended", "Desktop appended", [
+            {"role": "user", "content": "desktop turn", "timestamp": T + 2400},
+            {"role": "assistant", "content": "desktop answer", "timestamp": T + 2405},
+        ], {},
+    )]
+    _install_fixture(
+        monkeypatch, tmp_path,
+        extra_sessions=extra_sessions, extra_sidecars=extra_sidecars,
+    )
+
+    override_calls = []
+    real_all_sessions = routes.all_sessions
+
+    def _spy(diag=None, *, include_lineage_metadata=True, state_db_override_counts=True):
+        override_calls.append(state_db_override_counts)
+        return real_all_sessions(
+            diag=diag,
+            include_lineage_metadata=include_lineage_metadata,
+            state_db_override_counts=state_db_override_counts,
+        )
+
+    monkeypatch.setattr(routes, "all_sessions", _spy)
+    fast = _build_fast()
+    assert override_calls, "the fast builder must load webui rows through all_sessions"
+    assert all(flag is False for flag in override_calls), (
+        "the fast first paint must request tier-1 overrides only (no messages scan)"
+    )
+
+    row = next(r for r in fast["sessions"] if r["session_id"] == "webui-desktop-appended")
+    assert row["message_count"] == 5, "state.db sessions count must beat the sidecar's 2"
+    assert row["actual_message_count"] == 5
+    assert row["last_message_at"] == T + 2405, (
+        "documented divergence: the tier-2 last_message_at overlay waits for the rebuild"
+    )
+
+    full = _build_full()
+    full_row = next(r for r in full["sessions"] if r["session_id"] == "webui-desktop-appended")
+    assert full_row["message_count"] == 5
+    assert full_row["last_message_at"] == T + 2600  # tier-2 aggregation, settled
+
+
 def test_fast_payload_keeps_untitled_cli_and_acp_rows_visible(monkeypatch, tmp_path):
     """User-turn counts are unknown in the fast window; the bounded fallback
     query must still keep rows the full pipeline keeps."""
