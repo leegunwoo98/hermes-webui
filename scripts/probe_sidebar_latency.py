@@ -8,12 +8,23 @@ server uses):
      (``read_importable_agent_session_rows(limit=20, exclude_sources=("cron",
      "webhook", "kanban"))`` — the sidebar's visible CLI/agent window, and the
      Slice D candidate-ordering target). Measured FIRST in the process so the
-     first sample is the process's first state.db read (cold); later samples
-     are warm.
+     first sample is the process's first state.db DATA read (cold); later
+     samples are warm. The probe's own ``PRAGMA index_list(messages)`` guard and
+     the pass's schema PRAGMAs run before it.
   1. the Claude Code JSONL scan alone (``get_claude_code_sessions()``),
   2. the OLD lookup cost: full ``get_cli_sessions()`` projection + a linear
      scan for the sid (exactly what routes.py did before Slice A),
   3. the NEW targeted lookup: ``models.lookup_cli_session_metadata(sid)``.
+
+With ``--fast-sidebar-only`` (Slice C C4) the probe skips 0–3 and instead drives
+the real ``_get_cached_session_list_payload`` with both builders through the
+four cache states — post-restart/no-entry (cold: the fast first-paint payload is
+served while the full rebuild runs in the background), warm (cache hit),
+volatile-stale (served stale + background rebuild) and structural-stale (the
+non-fast-gated synchronous full rebuild) — plus per-piece timings for the fast
+build, the full build, ``all_sessions`` and the response conversion. Run it in
+a FRESH process for the post-restart number; clear-cache alone is not a restart
+(the models-layer CLI cache and the page cache survive).
 
 SAFETY: this script never writes to the store. It opens state.db read-only
 (URI mode=ro), and it monkeypatches every helper that could otherwise create
@@ -22,10 +33,14 @@ state: ``ensure_cron_project`` / ``ensure_webhook_project`` (projects.json),
 If ``idx_messages_session`` is missing from the target db, the projection's
 defensive index self-heal would open a writable connection — the probe checks
 for that up front and refuses to run unless ``--allow-index-selfheal`` is
-passed (the live dbs all have the index).
+passed (the live dbs all have the index). ``--fast-sidebar-only`` runs the real
+sidebar builders, whose ``all_sessions`` can write the WebUI session index on a
+backfill/recovery edge: point ``HERMES_HOME``/``HERMES_WEBUI_STATE_DIR`` at a
+copy of the store for that mode unless a read-only live run is acceptable.
 
 Usage (from the worktree root):
     python scripts/probe_sidebar_latency.py [--sid SID] [--runs 3]
+    HERMES_HOME=/tmp/copy python scripts/probe_sidebar_latency.py --fast-sidebar-only --runs 5
 """
 
 from __future__ import annotations
@@ -101,6 +116,201 @@ def _fmt(samples: list[float]) -> str:
     )
 
 
+def _percentile(samples: list[float], pct: float) -> float:
+    if not samples:
+        return 0.0
+    ordered = sorted(samples)
+    idx = min(len(ordered) - 1, max(0, int(round((pct / 100.0) * len(ordered))) - 1))
+    return ordered[idx]
+
+
+def _fast_sidebar_section(runs: int) -> int:
+    """Slice C C4: drive the real sidebar cache through the four cache states.
+
+    Uses the REAL builders (the fast first-paint builder + the full builder) and
+    a controlled source stamp so every state is reachable deterministically:
+    the probe monkeypatches ``routes._session_list_cache_source_stamp`` with a
+    mutable cell, stores the payload under one stamp, then flips the volatile or
+    structural part to produce the stale states. Runs the default /api/sessions
+    shape (visible_only, sidebar_source='webui', exclude_hidden).
+    """
+    import api.models as models
+    import api.routes as routes
+
+    args = dict(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+        show_claude_code_sessions=True,
+        include_archived=False,
+        exclude_hidden=True,
+        visible_only=True,
+        show_webhook_sessions=False,
+        show_kanban_sessions=False,
+        source_filter=None,
+        sidebar_source="webui",
+        archived_limit=None,
+        archived_offset=0,
+    )
+    key = routes._session_list_cache_key(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+        include_archived=False,
+        exclude_hidden=True,
+        visible_only=True,
+        show_webhook_sessions=False,
+        show_kanban_sessions=False,
+        source_filter=None,
+        sidebar_source="webui",
+        archived_limit=None,
+        archived_offset=0,
+    )
+
+    def fast_builder():
+        return routes._build_session_list_fast_payload(**args)
+
+    def full_builder():
+        return routes._build_session_list_cache_payload(**args)
+
+    stamp_cell = {"value": ("probe-structural-0", "probe-volatile-0")}
+    routes._session_list_cache_source_stamp = lambda _key: stamp_cell["value"]
+
+    def _wait_for_background_rebuild(timeout: float = 30.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with routes._SESSIONS_CACHE_LOCK:
+                inflight = routes._SESSIONS_CACHE_INFLIGHT.get(key)
+            if inflight is None:
+                return True
+            time.sleep(0.01)
+        return False
+
+    states: dict[str, list[float]] = {
+        "post-restart/no-entry (fast)": [],
+        "warm (cache hit)": [],
+        "volatile-stale (served stale + bg rebuild)": [],
+        "structural-stale (sync full rebuild)": [],
+    }
+    payload_stats: dict[str, object] = {}
+
+    for iteration in range(max(1, runs)):
+        # ── cold: no cache entry at all ──────────────────────────────────
+        routes._session_list_cache_clear()
+        stamp_cell["value"] = ("probe-structural-0", "probe-volatile-0")
+        started = time.perf_counter()
+        payload = routes._get_cached_session_list_payload(
+            key=key, builder=full_builder, fast_builder=fast_builder,
+        )
+        states["post-restart/no-entry (fast)"].append((time.perf_counter() - started) * 1000.0)
+        if iteration == 0:
+            payload_stats = {
+                "sessions": len(payload.get("sessions", [])),
+                "cli_count": payload.get("cli_count"),
+                "webui_session_count": payload.get("webui_session_count"),
+                "cli_session_count": payload.get("cli_session_count"),
+                "archived_count": payload.get("archived_count"),
+                "other_profile_count": payload.get("other_profile_count"),
+                "default_hidden": sum(
+                    1 for row in payload.get("sessions", []) if row.get("default_hidden")
+                ),
+            }
+        _wait_for_background_rebuild()
+
+        # ── warm: the stored full payload is fresh under the same stamp ──
+        started = time.perf_counter()
+        routes._get_cached_session_list_payload(
+            key=key, builder=full_builder, fast_builder=fast_builder,
+        )
+        states["warm (cache hit)"].append((time.perf_counter() - started) * 1000.0)
+
+        # ── volatile-stale: message-write churn only ─────────────────────
+        stamp_cell["value"] = ("probe-structural-0", f"probe-volatile-{iteration + 1}")
+        started = time.perf_counter()
+        routes._get_cached_session_list_payload(
+            key=key, builder=full_builder, fast_builder=fast_builder,
+        )
+        states["volatile-stale (served stale + bg rebuild)"].append(
+            (time.perf_counter() - started) * 1000.0
+        )
+        _wait_for_background_rebuild()
+
+        # ── structural-stale: not fast-gated, rebuilds synchronously ─────
+        stamp_cell["value"] = (f"probe-structural-{iteration + 1}", f"probe-volatile-{iteration + 1}")
+        started = time.perf_counter()
+        routes._get_cached_session_list_payload(
+            key=key, builder=full_builder, fast_builder=fast_builder,
+        )
+        states["structural-stale (sync full rebuild)"].append(
+            (time.perf_counter() - started) * 1000.0
+        )
+
+    routes._session_list_cache_clear()
+
+    print("fast-sidebar cache states (default /api/sessions shape):")
+    for state, samples in states.items():
+        print(f"  {state:46s} p50 {statistics.median(samples):8.1f} ms | p90 {_percentile(samples, 90):8.1f} ms | {_fmt(samples)}")
+    print(f"  payload: {payload_stats}")
+    print()
+
+    # ── per-piece timings (fresh samples; run AFTER the state loop so the
+    # page cache reflects the state loop, i.e. a warm-ish process) ────────
+    fast_samples, fast_payload = _timed(fast_builder, max(3, runs))
+    print(f"  fast payload build alone      : {_fmt(fast_samples)}")
+    full_samples, _ = _timed(full_builder, max(3, runs))
+    print(f"  full payload build alone      : {_fmt(full_samples)}")
+    all_samples, webui_rows = _timed(
+        lambda: models.all_sessions(diag=None, include_lineage_metadata=False), max(3, runs)
+    )
+    print(f"  all_sessions (webui side)     : {_fmt(all_samples)}  rows={len(webui_rows or [])}")
+    response_samples, _ = _timed(
+        lambda: routes._session_list_payload_to_response(fast_payload), max(3, runs)
+    )
+    print(f"  response conversion (fast)    : {_fmt(response_samples)}")
+    print()
+
+    # ── parity spot check: fast vs full visible ids on real data ─────────
+    routes._session_list_cache_clear()
+    fast_payload = fast_builder()
+    full_payload = full_builder()
+    fast_ids = [row.get("session_id") for row in fast_payload.get("sessions", [])]
+    full_ids = [row.get("session_id") for row in full_payload.get("sessions", [])]
+    print(f"  parity (real data): fast={len(fast_ids)} rows full={len(full_ids)} rows "
+          f"same_set={set(fast_ids) == set(full_ids)} same_order={fast_ids == full_ids}")
+    for field in ("cli_count", "webui_session_count", "cli_session_count",
+                  "archived_count", "archived_webui_count", "archived_cli_count",
+                  "other_profile_count"):
+        if fast_payload.get(field) != full_payload.get(field):
+            note = ""
+            if field in ("cli_count", "cli_session_count"):
+                note = (" [expected: the full payload counts the Claude Code JSONL scan's "
+                        "rows, which the fast path never produces]")
+            print(f"  parity count divergence {field}: fast={fast_payload.get(field)} "
+                  f"full={full_payload.get(field)}{note}")
+    diffs = 0
+    full_by_id = {row.get("session_id"): row for row in full_payload.get("sessions", [])}
+    for row in fast_payload.get("sessions", []):
+        ref = full_by_id.get(row.get("session_id"))
+        if ref is None:
+            continue
+        for field in ("title", "updated_at", "last_message_at", "message_count",
+                      "actual_message_count", "is_cli_session", "source_tag", "raw_source",
+                      "session_source", "source_label", "project_id", "pinned",
+                      "archived", "relationship_type", "parent_session_id",
+                      "_lineage_root_id", "_lineage_tip_id"):
+            if row.get(field) != ref.get(field):
+                diffs += 1
+                if diffs <= 10:
+                    print(f"  parity field diff {row.get('session_id')}.{field}: "
+                          f"fast={row.get(field)!r} full={ref.get(field)!r}")
+    print(f"  parity field diffs (client-read fields): {diffs}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sid", default=None, help="session id to look up")
@@ -110,6 +320,14 @@ def main() -> int:
         action="store_true",
         help="run even if idx_messages_session is missing (the projection may then "
         "open a writable connection to self-heal it)",
+    )
+    parser.add_argument(
+        "--fast-sidebar-only",
+        action="store_true",
+        help="Slice C C4: skip the CLI/lookup sections and measure the fast "
+        "first-paint sidebar path through the four cache states (run in a fresh "
+        "process for the post-restart number; point HERMES_HOME at a copy if the "
+        "store must not be touched)",
     )
     args = parser.parse_args()
 
@@ -139,11 +357,16 @@ def main() -> int:
 
     runs = max(1, args.runs)
 
+    if args.fast_sidebar_only:
+        print()
+        return _fast_sidebar_section(runs)
+
     # 0) Interactive pass (the sidebar's visible CLI/agent window). Measured
-    # FIRST in the process so sample 1 is the process's first state.db read
-    # (cold); later samples are warm. Pre-Slice-D this pass ordered its
-    # candidate window with a correlated per-row MAX(messages.timestamp)
-    # subquery; after the swap it uses the indexed
+    # FIRST in the process so sample 1 is the process's first state.db DATA read
+    # (cold); later samples are warm. (The probe's own PRAGMA guard and the
+    # pass's schema PRAGMAs have already touched the file.) Pre-Slice-D this
+    # pass ordered its candidate window with a correlated per-row
+    # MAX(messages.timestamp) subquery; after the swap it uses the indexed
     # COALESCE(s.last_activity_at, s.started_at) key.
     def interactive_pass():
         return models.read_importable_agent_session_rows(
