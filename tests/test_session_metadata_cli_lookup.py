@@ -188,6 +188,210 @@ def test_load_cli_sessions_uncached_default_still_scans_claude_code(monkeypatch,
     assert [row["session_id"] for row in rows] == ["claude_code_bulk"]
 
 
+def test_row_builder_characterization_interactive_pass(monkeypatch, tmp_path):
+    """A3 characterization: interactive-pass row shape (source-meta merge + title
+    fallback + workspace from the memoized resolver)."""
+    import api.models as models
+
+    db = tmp_path / "state.db"
+    db.write_text("", encoding="utf-8")
+    monkeypatch.setattr(models, "get_last_workspace", lambda: tmp_path)
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(models.Session, "load_metadata_only", lambda _sid: None)
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+
+    def fake_read_rows(_db_path, **kwargs):
+        if kwargs.get("include_sources") is None:
+            return [{
+                "id": "tui_characterization",
+                "title": None,
+                "model": "test-model",
+                "source": "tui",
+                "message_count": 2,
+                "actual_message_count": 2,
+                "actual_user_message_count": 1,
+                "last_activity": 10.0,
+                "started_at": 9.0,
+            }]
+        return []
+
+    monkeypatch.setattr(models, "read_importable_agent_session_rows", fake_read_rows)
+
+    rows = models._load_cli_sessions_uncached(tmp_path, db, _cli_profile="default")
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["session_id"] == "tui_characterization"
+    assert row["title"] == "Tui Session"
+    assert row["raw_source"] == "tui"
+    assert row["session_source"] == "cli"
+    assert row["source_label"] == "TUI"
+    assert row["is_cli_session"] is True
+    assert row["workspace"] == str(tmp_path)
+    assert row["created_at"] == 9.0
+    assert row["updated_at"] == 10.0
+    assert row["project_id"] is None
+    assert row["profile"] == "default"
+
+
+def test_row_builder_characterization_cron_pass_keeps_raw_fields(monkeypatch, tmp_path):
+    """A3 characterization: the cron pass keeps RAW row fields (no source-meta
+    merge) and its own title fallback."""
+    import api.models as models
+
+    db = tmp_path / "state.db"
+    db.write_text("", encoding="utf-8")
+    monkeypatch.setattr(models, "get_last_workspace", lambda: tmp_path)
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(models.Session, "load_metadata_only", lambda _sid: None)
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+    monkeypatch.setattr(models, "_profile_has_user_projects", lambda: False)
+    monkeypatch.setattr(models, "ensure_cron_project", lambda **_: "cron-project-id")
+
+    def fake_read_rows(_db_path, **kwargs):
+        if kwargs.get("include_sources") == ("cron",):
+            return [{
+                "id": "cron_job_characterization_1",
+                "title": None,
+                "model": "test-model",
+                "source": "cron",
+                "message_count": 1,
+                "actual_message_count": 1,
+                "actual_user_message_count": 1,
+                "last_activity": 10.0,
+                "started_at": 9.0,
+            }]
+        return []
+
+    monkeypatch.setattr(models, "read_importable_agent_session_rows", fake_read_rows)
+
+    rows = models._load_cli_sessions_uncached(tmp_path, db, _cli_profile="default")
+
+    assert [row["session_id"] for row in rows] == ["cron_job_characterization_1"]
+    row = rows[0]
+    assert row["title"] == "Cron Session"
+    # Raw-field semantics: no normalize_agent_session_source() fallback fill.
+    assert row["raw_source"] is None
+    assert row["session_source"] is None
+    assert row["source_label"] is None
+    assert row["source_tag"] == "cron"
+    assert row["is_cli_session"] is False
+    assert row["project_id"] == "cron-project-id"
+
+
+def test_row_builder_characterization_webhook_and_kanban_passes(monkeypatch, tmp_path):
+    """A3 characterization: webhook/kanban passes merge source meta; the webhook
+    pass resolves the workspace per row via get_last_workspace()."""
+    import api.models as models
+
+    db = tmp_path / "state.db"
+    db.write_text("", encoding="utf-8")
+    workspace_marker = tmp_path / "webhook-workspace"
+    workspace_calls = []
+
+    def fake_get_last_workspace():
+        workspace_calls.append(1)
+        return workspace_marker
+
+    monkeypatch.setattr(models, "get_last_workspace", fake_get_last_workspace)
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(models.Session, "load_metadata_only", lambda _sid: None)
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+    monkeypatch.setattr(models, "ensure_webhook_project", lambda: "webhook-project-id")
+
+    def fake_read_rows(_db_path, **kwargs):
+        include = kwargs.get("include_sources")
+        if include == ("webhook",):
+            return [{
+                "id": "webhook_characterization_1",
+                "title": None,
+                "model": "test-model",
+                "source": "webhook",
+                "message_count": 1,
+                "actual_message_count": 1,
+                "actual_user_message_count": 1,
+                "last_activity": 10.0,
+                "started_at": 9.0,
+            }]
+        if include == ("kanban",):
+            return [{
+                "id": "kanban_characterization_1",
+                "title": None,
+                "model": "test-model",
+                "source": "kanban",
+                "message_count": 1,
+                "actual_message_count": 1,
+                "actual_user_message_count": 1,
+                "last_activity": 8.0,
+                "started_at": 7.0,
+            }]
+        return []
+
+    monkeypatch.setattr(models, "read_importable_agent_session_rows", fake_read_rows)
+
+    rows = models._load_cli_sessions_uncached(tmp_path, db, _cli_profile="default")
+    by_id = {row["session_id"]: row for row in rows}
+
+    webhook = by_id["webhook_characterization_1"]
+    assert webhook["title"] == "Webhook Session"
+    assert webhook["raw_source"] == "webhook"
+    assert webhook["session_source"] == "webhook"
+    assert webhook["source_label"] == "Webhook"
+    assert webhook["is_cli_session"] is False
+    assert webhook["project_id"] == "webhook-project-id"
+    # Non-memoized resolver: the webhook pass calls get_last_workspace() per row.
+    assert webhook["workspace"] == str(workspace_marker)
+    assert workspace_calls
+
+    kanban = by_id["kanban_characterization_1"]
+    assert kanban["title"] == "Kanban Session"
+    assert kanban["raw_source"] == "kanban"
+    assert kanban["session_source"] == "kanban"
+    assert kanban["source_label"] == "Kanban"
+    assert kanban["is_cli_session"] is False
+    assert kanban["project_id"] is None
+
+
+def test_row_builder_characterization_sidecar_metadata_overrides_title_and_archived(monkeypatch, tmp_path):
+    """A3 characterization: sidecar (UI-owned) title/archived win over the
+    state.db projection for every pass."""
+    import api.models as models
+
+    db = tmp_path / "state.db"
+    db.write_text("", encoding="utf-8")
+    monkeypatch.setattr(models, "get_last_workspace", lambda: tmp_path)
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+    monkeypatch.setattr(
+        models,
+        "_state_projection_sidecar_metadata",
+        lambda sid: {"title": "Sidecar Title", "archived": True},
+    )
+
+    def fake_read_rows(_db_path, **kwargs):
+        if kwargs.get("include_sources") is None:
+            return [{
+                "id": "tui_sidecar_characterization",
+                "title": "State DB Title",
+                "model": "test-model",
+                "source": "tui",
+                "message_count": 1,
+                "actual_message_count": 1,
+                "actual_user_message_count": 1,
+                "last_activity": 10.0,
+                "started_at": 9.0,
+            }]
+        return []
+
+    monkeypatch.setattr(models, "read_importable_agent_session_rows", fake_read_rows)
+
+    rows = models._load_cli_sessions_uncached(tmp_path, db, _cli_profile="default")
+
+    assert len(rows) == 1
+    assert rows[0]["title"] == "Sidecar Title"
+    assert rows[0]["archived"] is True
+
+
 class _FakeSession:
     def __init__(self, *, is_cli_session=False, session_source=None, source_tag=None):
         self.session_id = "native_webui_001"

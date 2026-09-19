@@ -7712,6 +7712,90 @@ def _state_projection_sidecar_metadata(sid: str) -> dict:
     return dict(metadata)
 
 
+def _build_cli_session_row(
+    row: dict,
+    *,
+    profile_value: str,
+    source_tag: str,
+    project_id,
+    workspace: str,
+    sidecar_meta: dict | None = None,
+    default_title: str,
+    merge_source_meta: bool = True,
+) -> dict:
+    """Build one sidebar CLI row from a projected agent-session row.
+
+    Shared by all four ``_load_cli_sessions_uncached`` passes (interactive,
+    cron, webhook, kanban). The callers keep the pass-specific work outside:
+    the webui tombstone check, the cron-title lookup, the ``existing_sids``
+    dedupe, and the ``_source != expected`` guards.
+
+    ``merge_source_meta`` controls the ``normalize_agent_session_source``
+    fallback fill for ``raw_source``/``session_source``/``source_label`` and the
+    dict fed to ``is_cli_session_row``: real projected rows already carry those
+    fields (``_with_normalized_source``), so the merge is a no-op for them, but
+    the cron pass has historically kept raw-field semantics (no fill) and that
+    is preserved by passing ``merge_source_meta=False``.
+    """
+    sid = row.get('id')
+    source_meta = (
+        normalize_agent_session_source(row.get('source') or source_tag)
+        if merge_source_meta
+        else {}
+    )
+    if merge_source_meta:
+        raw_source = row.get('raw_source') or source_meta.get('raw_source')
+        session_source = row.get('session_source') or source_meta.get('session_source')
+        source_label = row.get('source_label') or source_meta.get('source_label')
+        classify_row = {**row, **source_meta}
+    else:
+        # Raw-field semantics (cron pass): no normalize_agent_session_source()
+        # fallback fill, and is_cli_session_row sees the row exactly as read.
+        raw_source = row.get('raw_source')
+        session_source = row.get('session_source')
+        source_label = row.get('source_label')
+        classify_row = row
+    sidecar_meta = sidecar_meta or {}
+    _title = row.get('title')
+    if sidecar_meta.get('title'):
+        _title = sidecar_meta['title']
+    return {
+        'session_id': sid,
+        'title': _title or default_title,
+        'workspace': workspace,
+        'model': row.get('model') or None,
+        'message_count': row.get('message_count') or row.get('actual_message_count') or 0,
+        'created_at': row.get('started_at'),
+        'updated_at': row.get('last_activity') or row.get('started_at'),
+        'pinned': False,
+        'archived': bool(sidecar_meta.get('archived')),
+        'project_id': project_id,
+        'profile': profile_value,
+        'source_tag': source_tag,
+        'raw_source': raw_source,
+        'user_id': row.get('user_id'),
+        'chat_id': row.get('chat_id') or row.get('origin_chat_id'),
+        'chat_type': row.get('chat_type'),
+        'thread_id': row.get('thread_id'),
+        'session_key': row.get('session_key'),
+        'platform': row.get('platform'),
+        'session_source': session_source,
+        'source_label': source_label,
+        'parent_session_id': row.get('parent_session_id'),
+        'parent_title': row.get('parent_title'),
+        'parent_source': row.get('parent_source'),
+        'relationship_type': row.get('relationship_type'),
+        '_parent_lineage_root_id': row.get('_parent_lineage_root_id'),
+        'end_reason': row.get('end_reason'),
+        'actual_message_count': row.get('actual_message_count'),
+        'user_message_count': row.get('actual_user_message_count'),
+        '_lineage_root_id': row.get('_lineage_root_id'),
+        '_lineage_tip_id': row.get('_lineage_tip_id'),
+        '_compression_segment_count': row.get('_compression_segment_count'),
+        'is_cli_session': is_cli_session_row(classify_row),
+    }
+
+
 @profile_home_resolve_cache_scope()
 def _load_cli_sessions_uncached(
     hermes_home: Path,
@@ -7849,7 +7933,6 @@ def _load_cli_sessions_uncached(
         session_ids=session_ids,
     ):
         sid = row['id']
-        raw_ts = row['last_activity'] or row['started_at']
         # Prefer the CLI session's own profile from the DB; fall back to
         # the active CLI profile so sidebar filtering works either way.
         profile = profile_value  # CLI DB has no profile column; use active profile
@@ -7863,7 +7946,6 @@ def _load_cli_sessions_uncached(
             and not (SESSION_DIR / f"{sid}.json").exists()
         ):
             continue
-        _source_meta = normalize_agent_session_source(_source)
         _title = row['title']
         if not _title and _source == 'cron':
             # Look up the human-friendly cron job name (cron_{job_id}_{ts}) from
@@ -7874,46 +7956,15 @@ def _load_cli_sessions_uncached(
         # the state.db projection. This keeps archived cron/tool/API runs hidden
         # even when all_sessions() omits the hidden sidecar and the state row is
         # re-injected from Hermes state.db (#4397).
-        _sidecar_meta = _state_projection_sidecar_metadata(sid)
-        if _sidecar_meta.get('title'):
-            _title = _sidecar_meta['title']
-        _archived = bool(_sidecar_meta.get('archived'))
-        _display_title = _title or f'{_source.title()} Session'
-        cli_sessions.append({
-            'session_id': sid,
-            'title': _display_title,
-            'workspace': _cli_workspace(),
-            'model': row['model'] or None,
-            'message_count': row['message_count'] or row['actual_message_count'] or 0,
-            'created_at': row['started_at'],
-            'updated_at': raw_ts,
-            'pinned': False,
-            'archived': _archived,
-            'project_id': _state_row_project_id(sid, _source),
-            'profile': profile,
-            'source_tag': _source,
-            'raw_source': row.get('raw_source') or _source_meta.get('raw_source'),
-            'user_id': row.get('user_id'),
-            'chat_id': row.get('chat_id') or row.get('origin_chat_id'),
-            'chat_type': row.get('chat_type'),
-            'thread_id': row.get('thread_id'),
-            'session_key': row.get('session_key'),
-            'platform': row.get('platform'),
-            'session_source': row.get('session_source') or _source_meta.get('session_source'),
-            'source_label': row.get('source_label') or _source_meta.get('source_label'),
-            'parent_session_id': row.get('parent_session_id'),
-            'parent_title': row.get('parent_title'),
-            'parent_source': row.get('parent_source'),
-            'relationship_type': row.get('relationship_type'),
-            '_parent_lineage_root_id': row.get('_parent_lineage_root_id'),
-            'end_reason': row.get('end_reason'),
-            'actual_message_count': row.get('actual_message_count'),
-            'user_message_count': row.get('actual_user_message_count'),
-            '_lineage_root_id': row.get('_lineage_root_id'),
-            '_lineage_tip_id': row.get('_lineage_tip_id'),
-            '_compression_segment_count': row.get('_compression_segment_count'),
-            'is_cli_session': is_cli_session_row({**row, **_source_meta}),
-        })
+        cli_sessions.append(_build_cli_session_row(
+            {**row, 'title': _title},
+            profile_value=profile,
+            source_tag=_source,
+            project_id=_state_row_project_id(sid, _source),
+            workspace=_cli_workspace(),
+            sidecar_meta=_state_projection_sidecar_metadata(sid),
+            default_title=f'{_source.title()} Session',
+        ))
 
     if source_filter is not None:
         return cli_sessions
@@ -7942,51 +7993,20 @@ def _load_cli_sessions_uncached(
                 _source = row['source'] or 'cli'
                 if _source != 'cron':
                     continue
-                raw_ts = row['last_activity'] or row['started_at']
                 _title = row['title']
                 if not _title:
                     # Friendly cron job name from the once-parsed jobs.json map.
                     _title = _cron_title_from_jobs(sid) or _title
-                _sidecar_meta = _state_projection_sidecar_metadata(sid)
-                if _sidecar_meta.get('title'):
-                    _title = _sidecar_meta['title']
-                _archived = bool(_sidecar_meta.get('archived'))
-                _display_title = _title or 'Cron Session'
-                cli_sessions.append({
-                    'session_id': sid,
-                    'title': _display_title,
-                    'workspace': _cli_workspace(),
-                    'model': row['model'] or None,
-                    'message_count': row['message_count'] or row['actual_message_count'] or 0,
-                    'created_at': row['started_at'],
-                    'updated_at': raw_ts,
-                    'pinned': False,
-                    'archived': _archived,
-                    'project_id': _cron_pid(),
-                    'profile': profile_value,
-                    'source_tag': 'cron',
-                    'raw_source': row.get('raw_source'),
-                    'user_id': row.get('user_id'),
-                    'chat_id': row.get('chat_id') or row.get('origin_chat_id'),
-                    'chat_type': row.get('chat_type'),
-                    'thread_id': row.get('thread_id'),
-                    'session_key': row.get('session_key'),
-                    'platform': row.get('platform'),
-                    'session_source': row.get('session_source'),
-                    'source_label': row.get('source_label'),
-                    'parent_session_id': row.get('parent_session_id'),
-                    'parent_title': row.get('parent_title'),
-                    'parent_source': row.get('parent_source'),
-                    'relationship_type': row.get('relationship_type'),
-                    '_parent_lineage_root_id': row.get('_parent_lineage_root_id'),
-                    'end_reason': row.get('end_reason'),
-                    'actual_message_count': row.get('actual_message_count'),
-                    'user_message_count': row.get('actual_user_message_count'),
-                    '_lineage_root_id': row.get('_lineage_root_id'),
-                    '_lineage_tip_id': row.get('_lineage_tip_id'),
-                    '_compression_segment_count': row.get('_compression_segment_count'),
-                    'is_cli_session': is_cli_session_row(row),
-                })
+                cli_sessions.append(_build_cli_session_row(
+                    {**row, 'title': _title},
+                    profile_value=profile_value,
+                    source_tag='cron',
+                    project_id=_cron_pid(),
+                    workspace=_cli_workspace(),
+                    sidecar_meta=_state_projection_sidecar_metadata(sid),
+                    default_title='Cron Session',
+                    merge_source_meta=False,
+                ))
                 existing_sids.add(sid)
         except Exception:
             logger.debug("Cron project-chip second pass failed", exc_info=True)
@@ -8011,49 +8031,15 @@ def _load_cli_sessions_uncached(
                 _source = row['source'] or 'webhook'
                 if _source != 'webhook':
                     continue
-                _source_meta = normalize_agent_session_source(_source)
-                raw_ts = row['last_activity'] or row['started_at']
-                _title = row['title']
-                _sidecar_meta = _state_projection_sidecar_metadata(sid)
-                if _sidecar_meta.get('title'):
-                    _title = _sidecar_meta['title']
-                _archived = bool(_sidecar_meta.get('archived'))
-                _display_title = _title or 'Webhook Session'
-                cli_sessions.append({
-                    'session_id': sid,
-                    'title': _display_title,
-                    'workspace': _cli_workspace(),
-                    'model': row['model'] or None,
-                    'message_count': row['message_count'] or row['actual_message_count'] or 0,
-                    'created_at': row['started_at'],
-                    'updated_at': raw_ts,
-                    'pinned': False,
-                    'archived': _archived,
-                    'project_id': _webhook_pid(),
-                    'profile': profile_value,
-                    'source_tag': 'webhook',
-                    'raw_source': row.get('raw_source') or _source_meta.get('raw_source'),
-                    'user_id': row.get('user_id'),
-                    'chat_id': row.get('chat_id') or row.get('origin_chat_id'),
-                    'chat_type': row.get('chat_type'),
-                    'thread_id': row.get('thread_id'),
-                    'session_key': row.get('session_key'),
-                    'platform': row.get('platform'),
-                    'session_source': row.get('session_source') or _source_meta.get('session_source'),
-                    'source_label': row.get('source_label') or _source_meta.get('source_label'),
-                    'parent_session_id': row.get('parent_session_id'),
-                    'parent_title': row.get('parent_title'),
-                    'parent_source': row.get('parent_source'),
-                    'relationship_type': row.get('relationship_type'),
-                    '_parent_lineage_root_id': row.get('_parent_lineage_root_id'),
-                    'end_reason': row.get('end_reason'),
-                    'actual_message_count': row.get('actual_message_count'),
-                    'user_message_count': row.get('actual_user_message_count'),
-                    '_lineage_root_id': row.get('_lineage_root_id'),
-                    '_lineage_tip_id': row.get('_lineage_tip_id'),
-                    '_compression_segment_count': row.get('_compression_segment_count'),
-                    'is_cli_session': is_cli_session_row({**row, **_source_meta}),
-                })
+                cli_sessions.append(_build_cli_session_row(
+                    row,
+                    profile_value=profile_value,
+                    source_tag='webhook',
+                    project_id=_webhook_pid(),
+                    workspace=_cli_workspace(),
+                    sidecar_meta=_state_projection_sidecar_metadata(sid),
+                    default_title='Webhook Session',
+                ))
                 existing_sids.add(sid)
         except Exception:
             logger.debug("Webhook project-chip second pass failed", exc_info=True)
@@ -8077,48 +8063,15 @@ def _load_cli_sessions_uncached(
                 _source = row['source'] or 'kanban'
                 if _source != 'kanban':
                     continue
-                _source_meta = normalize_agent_session_source(_source)
-                raw_ts = row['last_activity'] or row['started_at']
-                _title = row['title']
-                _sidecar_meta = _state_projection_sidecar_metadata(sid)
-                if _sidecar_meta.get('title'):
-                    _title = _sidecar_meta['title']
-                _archived = bool(_sidecar_meta.get('archived'))
-                cli_sessions.append({
-                    'session_id': sid,
-                    'title': _title or 'Kanban Session',
-                    'workspace': _cli_workspace(),
-                    'model': row['model'] or None,
-                    'message_count': row['message_count'] or row['actual_message_count'] or 0,
-                    'created_at': row['started_at'],
-                    'updated_at': raw_ts,
-                    'pinned': False,
-                    'archived': _archived,
-                    'project_id': _state_row_project_id(sid, _source),
-                    'profile': profile_value,
-                    'source_tag': 'kanban',
-                    'raw_source': row.get('raw_source') or _source_meta.get('raw_source'),
-                    'user_id': row.get('user_id'),
-                    'chat_id': row.get('chat_id') or row.get('origin_chat_id'),
-                    'chat_type': row.get('chat_type'),
-                    'thread_id': row.get('thread_id'),
-                    'session_key': row.get('session_key'),
-                    'platform': row.get('platform'),
-                    'session_source': row.get('session_source') or _source_meta.get('session_source'),
-                    'source_label': row.get('source_label') or _source_meta.get('source_label'),
-                    'parent_session_id': row.get('parent_session_id'),
-                    'parent_title': row.get('parent_title'),
-                    'parent_source': row.get('parent_source'),
-                    'relationship_type': row.get('relationship_type'),
-                    '_parent_lineage_root_id': row.get('_parent_lineage_root_id'),
-                    'end_reason': row.get('end_reason'),
-                    'actual_message_count': row.get('actual_message_count'),
-                    'user_message_count': row.get('actual_user_message_count'),
-                    '_lineage_root_id': row.get('_lineage_root_id'),
-                    '_lineage_tip_id': row.get('_lineage_tip_id'),
-                    '_compression_segment_count': row.get('_compression_segment_count'),
-                    'is_cli_session': is_cli_session_row({**row, **_source_meta}),
-                })
+                cli_sessions.append(_build_cli_session_row(
+                    row,
+                    profile_value=profile_value,
+                    source_tag='kanban',
+                    project_id=_state_row_project_id(sid, _source),
+                    workspace=_cli_workspace(),
+                    sidecar_meta=_state_projection_sidecar_metadata(sid),
+                    default_title='Kanban Session',
+                ))
                 existing_sids.add(sid)
         except Exception:
             logger.debug("Kanban sidebar second pass failed", exc_info=True)
