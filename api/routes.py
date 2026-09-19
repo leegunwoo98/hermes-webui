@@ -8163,12 +8163,16 @@ def _lookup_cli_session_metadata(session_id: str, *, all_profiles: bool = False)
     if not session_id:
         return {}
     try:
-        for row in get_cli_sessions(all_profiles=all_profiles):
-            if row.get("session_id") == session_id:
-                return row
+        # Slice A (webui-sidebar-latency v2): targeted, chain-aware
+        # single-session read in api/models.py. The old implementation rebuilt
+        # the entire get_cli_sessions() projection (plus the global Claude Code
+        # JSONL scan) and linearly scanned it for one row, which wedged the
+        # chat-open path. Name/signature kept: many call sites and tests
+        # monkeypatch this wrapper.
+        from api import models as _models
+        return _models.lookup_cli_session_metadata(session_id, all_profiles=all_profiles)
     except Exception:
         return {}
-    return {}
 
 
 def _session_index_marks_was_webui(sid: str) -> bool:

@@ -330,13 +330,18 @@ def test_api_sessions_passes_source_filter_only_on_sidebar_path(monkeypatch):
     assert captured == [{"source_filter": "  TUI  ", "all_profiles": False}]
 
 
-def test_non_sidebar_cli_session_callers_keep_default_get_cli_sessions_signature(monkeypatch):
+def test_non_sidebar_cli_session_callers_keep_default_lookup_signature(monkeypatch):
+    """Slice A rewire: the routes wrapper still passes the default
+    all_profiles=False through to the targeted models lookup."""
     captured = []
 
     monkeypatch.setattr(
-        routes,
-        "get_cli_sessions",
-        lambda *, all_profiles=False: captured.append(all_profiles) or [{"session_id": "cli-session", "title": "CLI Session"}],
+        models,
+        "lookup_cli_session_metadata",
+        lambda session_id, *, all_profiles=False: captured.append(all_profiles) or {
+            "session_id": session_id,
+            "title": "CLI Session",
+        },
     )
 
     assert routes._lookup_cli_session_metadata("cli-session") == {

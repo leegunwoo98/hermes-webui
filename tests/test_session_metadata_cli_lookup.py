@@ -462,6 +462,272 @@ def test_lookup_claude_code_session_row_early_exits_on_matching_file(monkeypatch
     assert models._lookup_claude_code_session_row("not_a_claude_sid", projects_dir=projects_dir) == {}
 
 
+def _make_chain_state_db(path: Path) -> None:
+    """state.db covering the lineage/divergence shapes the lookup must match:
+    compression chain, plain parent/child, subagent child, and
+    desktop/webui/kanban/cron/messaging/state.db-claude-code rows."""
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT,
+            session_source TEXT,
+            title TEXT,
+            model TEXT,
+            started_at REAL NOT NULL,
+            message_count INTEGER DEFAULT 0,
+            parent_session_id TEXT,
+            ended_at REAL,
+            end_reason TEXT,
+            user_id TEXT,
+            chat_id TEXT,
+            chat_type TEXT,
+            thread_id TEXT,
+            session_key TEXT,
+            platform TEXT
+        );
+        CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT,
+            role TEXT,
+            content TEXT,
+            timestamp REAL
+        );
+        CREATE INDEX idx_messages_session ON messages(session_id, timestamp);
+        """
+    )
+    rows = [
+        # (sid, source, session_source, title, started_at, parent, ended_at, end_reason)
+        ("root_compression", "tui", "tui", "Long Conversation", 100.0, None, 150.0, "compression"),
+        ("tip_compression", "tui", "tui", None, 160.0, "root_compression", None, None),
+        ("parent_plain", "tui", "tui", "Parent title", 200.0, None, None, None),
+        ("child_plain", "tui", "tui", "Child title", 210.0, "parent_plain", None, None),
+        ("sa_parent", "subagent", "subagent", "Subagent parent", 300.0, None, None, None),
+        ("sa_child", "subagent", "subagent", "Subagent child", 310.0, "sa_parent", None, None),
+        ("desktop_row", "desktop", "desktop", "Desktop Session", 400.0, None, None, None),
+        ("webui_row", "webui", "webui", "WebUI Session", 410.0, None, None, None),
+        ("kanban_row", "kanban", "kanban", "Kanban Session", 420.0, None, None, None),
+        ("cron_jobchain_1", "cron", "cron", "Cron Session", 430.0, None, None, None),
+        ("telegram_row", "telegram", "messaging", "Telegram Session", 440.0, None, None, None),
+        # state.db claude-code family: real ids are timestamped, NOT claude_code_*.
+        ("20260919_115234_32234b", "claude-code", "claude-code", "Claude State DB", 450.0, None, None, None),
+    ]
+    for sid, source, session_source, title, started_at, parent, ended_at, end_reason in rows:
+        conn.execute(
+            "INSERT INTO sessions (id, source, session_source, title, model, started_at,"
+            " message_count, parent_session_id, ended_at, end_reason, user_id, chat_id,"
+            " chat_type, thread_id, session_key, platform)"
+            " VALUES (?, ?, ?, ?, 'test-model', ?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                sid, source, session_source, title, started_at, parent, ended_at, end_reason,
+                "u-1" if source == "telegram" else None,
+                "chat-1" if source == "telegram" else None,
+                "private" if source == "telegram" else None,
+                None,
+                "sk-1" if source == "telegram" else None,
+                "telegram" if source == "telegram" else None,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, timestamp)"
+            " VALUES (?, ?, 'user', 'hello', ?)",
+            (f"msg_{sid}_1", sid, started_at),
+        )
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, timestamp)"
+            " VALUES (?, ?, 'assistant', 'ok', ?)",
+            (f"msg_{sid}_2", sid, started_at + 1.0),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _pin_fixture_environment(monkeypatch, tmp_path, *, db=None):
+    """Pin HERMES_HOME/profile resolution and the loader's read-only helpers to
+    a tmp fixture so no test touches the live store."""
+    import api.models as models
+    import api.profiles as profiles
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(exist_ok=True)
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: str(hermes_home))
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(models, "get_last_workspace", lambda: tmp_path)
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(models.Session, "load_metadata_only", lambda _sid: None)
+    monkeypatch.setattr(models, "_profile_has_user_projects", lambda: False)
+    monkeypatch.setattr(models, "ensure_cron_project", lambda **_: "cron-project-id")
+    monkeypatch.setattr(models, "ensure_webhook_project", lambda: "webhook-project-id")
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda *a, **k: [])
+    models.clear_cli_sessions_cache()
+    return hermes_home
+
+
+def _bulk_rows_by_id(models) -> dict:
+    return {row["session_id"]: row for row in models.get_cli_sessions()}
+
+
+def test_lookup_cli_session_metadata_returns_single_row_matching_bulk(monkeypatch, tmp_path):
+    """A4: the targeted lookup returns the same dict as the bulk projection."""
+    import api.models as models
+
+    hermes_home = _pin_fixture_environment(monkeypatch, tmp_path)
+    db = hermes_home / "state.db"
+    _make_multi_source_state_db(db)
+
+    bulk = _bulk_rows_by_id(models)
+    assert "telegram_session" in bulk
+
+    row = models.lookup_cli_session_metadata("telegram_session")
+
+    assert row == bulk["telegram_session"]
+
+
+def test_lookup_cli_session_metadata_returns_empty_for_blank_or_unknown(monkeypatch, tmp_path):
+    import api.models as models
+
+    hermes_home = _pin_fixture_environment(monkeypatch, tmp_path)
+    _make_multi_source_state_db(hermes_home / "state.db")
+
+    assert models.lookup_cli_session_metadata("") == {}
+    assert models.lookup_cli_session_metadata("   ") == {}
+    assert models.lookup_cli_session_metadata("missing_sid") == {}
+
+
+def test_lookup_child_with_parent_in_window_matches_bulk(monkeypatch, tmp_path):
+    """A4 chain-awareness: a child gets parent_title/parent_source/lineage root
+    exactly like the bulk window row."""
+    import api.models as models
+
+    hermes_home = _pin_fixture_environment(monkeypatch, tmp_path)
+    _make_chain_state_db(hermes_home / "state.db")
+
+    bulk = _bulk_rows_by_id(models)
+    row = models.lookup_cli_session_metadata("child_plain")
+
+    assert row["parent_title"] == "Parent title"
+    assert row["parent_source"] == "tui"
+    assert row["relationship_type"] == "child_session"
+    assert row["_parent_lineage_root_id"] == "parent_plain"
+    assert row == bulk["child_plain"]
+
+
+def test_lookup_compression_tip_reproduces_merged_root_row(monkeypatch, tmp_path):
+    """A4 chain-awareness: a chain tip resolves to the merged root row."""
+    import api.models as models
+
+    hermes_home = _pin_fixture_environment(monkeypatch, tmp_path)
+    _make_chain_state_db(hermes_home / "state.db")
+
+    bulk = _bulk_rows_by_id(models)
+    tip = models.lookup_cli_session_metadata("tip_compression")
+
+    assert tip["session_id"] == "tip_compression"
+    assert tip["title"] == "Long Conversation"
+    assert tip["created_at"] == 100.0
+    assert tip["_lineage_root_id"] == "root_compression"
+    assert tip["_lineage_tip_id"] == "tip_compression"
+    assert tip["_compression_segment_count"] == 2
+    assert tip == bulk["tip_compression"]
+
+
+def test_lookup_compression_root_returns_own_row_known_divergence(monkeypatch, tmp_path):
+    """A4 accepted divergence: a chain ROOT resolves to its own row, while the
+    bulk payload shows only the merged tip row."""
+    import api.models as models
+
+    hermes_home = _pin_fixture_environment(monkeypatch, tmp_path)
+    _make_chain_state_db(hermes_home / "state.db")
+
+    bulk_ids = set(_bulk_rows_by_id(models))
+    assert "root_compression" not in bulk_ids
+
+    root = models.lookup_cli_session_metadata("root_compression")
+
+    assert root["session_id"] == "root_compression"
+    assert root["title"] == "Long Conversation"
+    assert root.get("_lineage_tip_id") is None
+    assert root.get("_lineage_root_id") is None
+
+
+def test_lookup_subagent_child_matches_bulk(monkeypatch, tmp_path):
+    import api.models as models
+
+    hermes_home = _pin_fixture_environment(monkeypatch, tmp_path)
+    _make_chain_state_db(hermes_home / "state.db")
+
+    bulk = _bulk_rows_by_id(models)
+    row = models.lookup_cli_session_metadata("sa_child")
+
+    assert row["parent_session_id"] == "sa_parent"
+    assert row["parent_title"] == "Subagent parent"
+    assert row == bulk["sa_child"]
+
+
+def test_cli_session_ancestor_ids_walk_is_bounded(tmp_path):
+    """A4: the ancestor walk is bounded (<= 20 ids) and starts at the sid."""
+    import api.models as models
+
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT);")
+    for i in range(30):
+        conn.execute(
+            "INSERT INTO sessions (id, parent_session_id) VALUES (?, ?)",
+            (f"seg_{i}", f"seg_{i - 1}" if i else None),
+        )
+    conn.commit()
+    conn.close()
+
+    ids = models._cli_session_ancestor_ids(db, "seg_29")
+
+    assert ids[0] == "seg_29"
+    assert len(ids) <= 20
+    assert ids == tuple(f"seg_{i}" for i in range(29, 29 - len(ids), -1))
+
+
+def test_routes_lookup_wrapper_delegates_to_models_lookup(monkeypatch):
+    """A4 rewire: routes keeps its name/signature but the targeted models
+    function does the work (default all_profiles=False)."""
+    import api.models as models
+    import api.routes as routes
+
+    calls = []
+
+    def fake_lookup(session_id, *, all_profiles=False):
+        calls.append((session_id, all_profiles))
+        return {"session_id": session_id, "title": "CLI Session"}
+
+    monkeypatch.setattr(models, "lookup_cli_session_metadata", fake_lookup)
+
+    assert routes._lookup_cli_session_metadata("cli-session") == {
+        "session_id": "cli-session",
+        "title": "CLI Session",
+    }
+    assert calls == [("cli-session", False)]
+
+    assert routes._lookup_cli_session_metadata("cli-session", all_profiles=True) == {
+        "session_id": "cli-session",
+        "title": "CLI Session",
+    }
+    assert calls[-1] == ("cli-session", True)
+
+    assert routes._lookup_cli_session_metadata("") == {}
+
+
+def test_routes_lookup_wrapper_returns_empty_on_models_failure(monkeypatch):
+    import api.models as models
+    import api.routes as routes
+
+    def boom(_session_id, *, all_profiles=False):
+        raise RuntimeError("lookup exploded")
+
+    monkeypatch.setattr(models, "lookup_cli_session_metadata", boom)
+
+    assert routes._lookup_cli_session_metadata("cli-session") == {}
+
+
 class _FakeSession:
     def __init__(self, *, is_cli_session=False, session_source=None, source_tag=None):
         self.session_id = "native_webui_001"

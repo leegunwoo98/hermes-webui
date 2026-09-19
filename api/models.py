@@ -49,6 +49,11 @@ from api.process_event_utils import stamp_message_source
 
 logger = logging.getLogger(__name__)
 CLI_VISIBLE_SESSION_LIMIT = 20
+# Bound for the targeted single-session metadata lookup's parent_session_id
+# ancestor walk (``_cli_session_ancestor_ids``): sid + up to 19 ancestors, one
+# primary-key read per level. Deeper chains resolve their oldest segments
+# as-if-top-level, mirroring the bulk window's own bounded ancestor recovery.
+CLI_LOOKUP_MAX_ANCESTORS = 20
 # How many messageful cron sessions to surface in the project-chip layer.
 # Needs to exceed CLI_VISIBLE_SESSION_LIMIT so older cron runs stay
 # addressable even when many newer non-cron sessions dominate the default
@@ -8130,6 +8135,126 @@ def _load_cli_sessions_uncached(
             logger.debug("Kanban sidebar second pass failed", exc_info=True)
 
     return cli_sessions
+
+
+def _cli_session_ancestor_ids(
+    db_path: Path,
+    session_id: str,
+    *,
+    max_depth: int = CLI_LOOKUP_MAX_ANCESTORS,
+) -> tuple[str, ...]:
+    """Return ``session_id`` plus its bounded ``parent_session_id`` ancestor chain.
+
+    One primary-key lookup per level on a read-only handle. Used by the
+    targeted single-session metadata lookup so a mini-set can be projected
+    through the same path as the bulk window: a chain tip needs its root
+    (title/started_at/lineage), and a child needs its parent (parent_title/
+    parent_source/_parent_lineage_root_id). The walk starts at ``sid`` and
+    stops after ``max_depth`` ids or at the first missing parent, so it can
+    never loop on a cyclic chain. Always returns at least ``(sid,)``.
+    """
+    sid = str(session_id or '').strip()
+    if not sid:
+        return ()
+    import sqlite3
+
+    ids: list[str] = []
+    seen: set[str] = set()
+    try:
+        db_path = Path(db_path)
+        try:
+            conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+        except sqlite3.Error:
+            # Missing/unreadable db: let the loader decide (it returns [] for a
+            # missing db). Deliberately no writable fallback here — a targeted
+            # read must never create or write the store.
+            return (sid,)
+        with closing(conn):
+            cur = conn.cursor()
+            try:
+                cur.execute("PRAGMA table_info(sessions)")
+                session_cols = {row[1] for row in cur.fetchall()}
+            except sqlite3.Error:
+                session_cols = set()
+            if 'parent_session_id' not in session_cols:
+                return (sid,)
+            current = sid
+            while current and current not in seen and len(ids) < max_depth:
+                seen.add(current)
+                ids.append(current)
+                cur.execute(
+                    "SELECT parent_session_id FROM sessions WHERE id = ?",
+                    (current,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    break
+                current = str(row[0] or '').strip()
+    except Exception:
+        logger.debug("CLI session ancestor walk failed for %s", sid, exc_info=True)
+    return tuple(ids) if ids else (sid,)
+
+
+def lookup_cli_session_metadata(session_id: str, *, all_profiles: bool = False) -> dict:
+    """Single-session equivalent of the ``get_cli_sessions`` projection.
+
+    Targeted, chain-aware read for routes that need one session's CLI metadata
+    (chat-open, import/claim, archive, delete, ...). Instead of rebuilding the
+    full interactive/cron/webhook/kanban projection and the global Claude Code
+    JSONL scan, it fetches the session row plus its bounded
+    ``parent_session_id`` ancestor chain (``_cli_session_ancestor_ids``) and
+    projects that mini-set through the exact same ``_load_cli_sessions_uncached``
+    path, so:
+
+    - a compression/cli_close chain tip reproduces the merged root row (root
+      title/started_at plus ``_lineage_root_id``/``_lineage_tip_id``/
+      ``_compression_segment_count``);
+    - a child gets ``parent_title``/``parent_source``/``_parent_lineage_root_id``
+      exactly like the bulk window row whenever its parent is reachable (the
+      bulk window can miss a parent outside its 20-row slice; the targeted walk
+      resolves it up to ``CLI_LOOKUP_MAX_ANCESTORS`` levels).
+
+    Known accepted divergence (asserted in tests): a chain ROOT resolves to its
+    own row, while the bulk payload only contains the merged tip row.
+
+    Returns ``{}`` when nothing matches — including a tombstoned WebUI row,
+    which the loader drops exactly like the bulk projection does. The
+    ``all_profiles`` mode iterates profile contexts in the same order
+    ``get_cli_sessions`` merges them, so first-match semantics are preserved.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return {}
+    try:
+        contexts = (
+            list(_all_profiles_cli_contexts()[0])
+            if all_profiles else [_resolve_cli_sessions_context(None)[:3]]
+        )
+    except Exception:
+        logger.debug("CLI metadata lookup context resolution failed for %s", sid, exc_info=True)
+        return {}
+    for ctx_home, ctx_db_path, ctx_profile in contexts:
+        try:
+            ids = _cli_session_ancestor_ids(ctx_db_path, sid)
+            rows = _load_cli_sessions_uncached(
+                ctx_home,
+                ctx_db_path,
+                ctx_profile,
+                session_ids=ids,
+                # Size the visible slice to the mini-set so the post-projection
+                # slice can never drop the requested row (the id filter is a
+                # WHERE clause, but the display slice is applied afterwards).
+                visible_session_limit=len(ids),
+            )
+        except Exception:
+            logger.debug("Targeted CLI metadata lookup failed for %s", sid, exc_info=True)
+            continue
+        for row in rows:
+            if row.get("session_id") == sid:
+                return row
+    if sid.startswith(f"{CLAUDE_CODE_SOURCE}_"):
+        return _lookup_claude_code_session_row(sid)
+    return {}
 
 
 def get_cli_sessions(
