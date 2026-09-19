@@ -42,6 +42,7 @@ from api.agent_sessions import (
     is_cli_session_row,
     normalize_agent_session_source,
     open_state_db_readonly,
+    read_fast_sidebar_agent_rows,
     read_importable_agent_session_rows,
     read_session_lineage_metadata,
 )
@@ -6206,7 +6207,11 @@ def _read_state_db_sidebar_overrides(
             return overrides
 
 
-def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
+def _apply_sidebar_state_db_overrides(
+    sessions: list[dict],
+    *,
+    include_message_counts: bool = True,
+) -> None:
     """Apply state.db source/title overrides without full lineage enrichment.
 
     Source classification (source/title) is corrected for ALL rows because it
@@ -6219,6 +6224,12 @@ def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
     concurrent poll (#5132). The cap is env-configurable and fails open; rows
     beyond it keep their JSON message-count/last-message until the history panel
     opens (lazily corrected, exactly as with the lineage cap #4638).
+
+    ``include_message_counts=False`` (Slice C fast first paint) keeps the tier-1
+    primary-key source/title/count fetch for every row but skips the messages
+    aggregation entirely: the fast payload must not pay a ``messages`` scan on
+    the request thread, and the background full rebuild restores the aggregated
+    ``last_message_at`` overlay within its window.
     """
     import os as _os
     try:
@@ -6226,7 +6237,11 @@ def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
     except (TypeError, ValueError):
         _cap = 300
     all_ids = {str(s.get('session_id')) for s in sessions if s.get('session_id')}
-    if _cap > 0 and len(sessions) > _cap:
+    if not include_message_counts:
+        # Tier-1 only: ``_read_state_db_sidebar_overrides`` intersects this with
+        # the wanted ids, so an empty set skips every COUNT/MAX GROUP BY.
+        count_ids: set[str] | None = set()
+    elif _cap > 0 and len(sessions) > _cap:
         count_ids = {str(s.get('session_id')) for s in sessions[:_cap] if s.get('session_id')}
     else:
         count_ids = None  # cap disabled / under cap -> count every row too
@@ -6383,6 +6398,7 @@ def all_sessions(
     *,
     include_lineage_metadata: bool = True,
     sidebar_metadata_only: bool = False,
+    state_db_override_counts: bool = True,
 ):
     _diag_stage(diag, "all_sessions.active_streams")
     active_stream_ids = _active_stream_ids()
@@ -6523,7 +6539,9 @@ def all_sessions(
                 _enrich_sidebar_lineage_metadata(result)
             else:
                 _diag_stage(diag, "all_sessions.state_db_overrides")
-                _apply_sidebar_state_db_overrides(result)
+                _apply_sidebar_state_db_overrides(
+                    result, include_message_counts=state_db_override_counts
+                )
                 _diag_stage(diag, "all_sessions.lineage_metadata_skipped")
             result = _prefer_fuller_snapshots_for_sidebar(result)
             sidebar_candidates = result
@@ -6585,7 +6603,9 @@ def all_sessions(
         _enrich_sidebar_lineage_metadata(result)
     else:
         _diag_stage(diag, "all_sessions.state_db_overrides")
-        _apply_sidebar_state_db_overrides(result)
+        _apply_sidebar_state_db_overrides(
+            result, include_message_counts=state_db_override_counts
+        )
         _diag_stage(diag, "all_sessions.lineage_metadata_skipped")
     result = _prefer_fuller_snapshots_for_sidebar(result)
     sidebar_candidates = result
@@ -7472,6 +7492,19 @@ def _path_stat_cache_key(path):
         return None
 
 
+def _callable_accepts_kwarg(callable_obj, kwarg_name: str) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return True
+    if kwarg_name in signature.parameters:
+        return True
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
 def _callable_accepts_include_claude_code(callable_obj) -> bool:
     try:
         signature = inspect.signature(callable_obj)
@@ -7867,8 +7900,16 @@ def _load_cli_sessions_uncached(
     kanban_project_limit: int | None | bool = KANBAN_PROJECT_CHIP_LIMIT,
     include_claude_code: bool = True,
     session_ids: tuple[str, ...] | None = None,
+    fast_window: bool = False,
 ) -> list:
     cli_sessions = []
+    # Slice C: the bounded first-paint window (``read_fast_sidebar_agent_rows``)
+    # replaces the messages-JOIN projection for all four passes below. It is
+    # never cached by ``get_cli_sessions`` — only the fast route builder calls
+    # it, and the full rebuild must stay the source of the stored payload.
+    _read_sidebar_rows = (
+        read_fast_sidebar_agent_rows if fast_window else read_importable_agent_session_rows
+    )
     # A targeted read (``session_ids`` set) must never pay the global Claude
     # Code JSONL scan: the scan walks every ``~/.claude/projects`` transcript
     # (lstat + parse, up to CLAUDE_CODE_MAX_FILES) and cannot be narrowed by
@@ -7974,7 +8015,7 @@ def _load_cli_sessions_uncached(
         _deleted_webui_tombstone = _load_webui_deleted_session_tombstone()
     except Exception:
         _deleted_webui_tombstone = frozenset()
-    for row in read_importable_agent_session_rows(
+    for row in _read_sidebar_rows(
         db_path,
         limit=visible_session_limit if visible_session_limit is not None else (
             CRON_PROJECT_CHIP_LIMIT if source_filter == 'cron'
@@ -8037,7 +8078,7 @@ def _load_cli_sessions_uncached(
     if cron_project_limit is not False:
         existing_sids = {s['session_id'] for s in cli_sessions}
         try:
-            for row in read_importable_agent_session_rows(
+            for row in _read_sidebar_rows(
                 db_path,
                 limit=cron_project_limit,
                 log=logger,
@@ -8075,7 +8116,7 @@ def _load_cli_sessions_uncached(
     if webhook_project_limit is not False:
         existing_sids = {s['session_id'] for s in cli_sessions}
         try:
-            for row in read_importable_agent_session_rows(
+            for row in _read_sidebar_rows(
                 db_path,
                 limit=webhook_project_limit,
                 log=logger,
@@ -8107,7 +8148,7 @@ def _load_cli_sessions_uncached(
     if kanban_project_limit is not False:
         existing_sids = {s['session_id'] for s in cli_sessions}
         try:
-            for row in read_importable_agent_session_rows(
+            for row in _read_sidebar_rows(
                 db_path,
                 limit=kanban_project_limit,
                 log=logger,
@@ -8268,12 +8309,20 @@ def get_cli_sessions(
     *,
     all_profiles: bool = False,
     include_claude_code: bool = True,
+    fast_window: bool = False,
 ) -> list:
     """Read CLI sessions from the agent's SQLite store and return them as
     dicts in a format the WebUI sidebar can render alongside local sessions.
 
     Returns empty list if the SQLite DB is missing or any error occurs -- the
     bridge is purely additive and never crashes the WebUI.
+
+    ``fast_window=True`` (Slice C fast first paint) projects the bounded
+    ``read_fast_sidebar_agent_rows`` window through the same loader and NEVER
+    touches the models-layer CLI cache: a stored fast list would later be served
+    to the full builder (missing the Claude Code scan's rows), and a stored full
+    list would defeat the fast path. Single-profile only — the aggregate
+    ``all_profiles`` branch ignores the flag and keeps its full loads.
     """
     source_filter = _normalize_cli_session_source_filter(source_filter)
     if all_profiles:
@@ -8314,6 +8363,15 @@ def get_cli_sessions(
         loader_supports_include_claude_code = _callable_accepts_include_claude_code(
             _load_cli_sessions_uncached
         )
+        # Slice C: the bounded first-paint window is a single-profile read and is
+        # only ever requested by the fast route builder (all_profiles is out of
+        # the fast gate). A monkeypatched/legacy loader that cannot honor the
+        # flag keeps its own behavior.
+        use_fast_window = (
+            bool(fast_window)
+            and not all_profiles
+            and _callable_accepts_kwarg(_load_cli_sessions_uncached, 'fast_window')
+        )
         if all_profiles:
             merged: list[dict] = []
             for idx, (ctx_home, ctx_db_path, ctx_profile) in enumerate(contexts):
@@ -8338,12 +8396,28 @@ def get_cli_sessions(
         load_kwargs = {'source_filter': source_filter}
         if loader_supports_include_claude_code:
             load_kwargs['include_claude_code'] = include_claude_code
+        if use_fast_window:
+            load_kwargs['fast_window'] = True
         return _load_cli_sessions_uncached(
             hermes_home,
             db_path,
             cli_profile,
             **load_kwargs,
         )
+
+    if fast_window and not all_profiles:
+        # Never read or write the models-layer CLI cache on the fast window: a
+        # stored fast list would be served to the full builder (missing the
+        # Claude Code scan's rows) and a stored full list would defeat the fast
+        # path. The background full rebuild is the only writer of that cache.
+        try:
+            return _load_sessions()
+        except Exception as _cli_err:
+            logger.warning(
+                "get_cli_sessions(fast_window) failed — check state.db schema or path (%s): %s",
+                db_path, _cli_err,
+            )
+            return []
 
     if ttl > 0:
         stale_sessions = None

@@ -889,6 +889,263 @@ def read_importable_agent_session_rows(
 
 
 
+FAST_SIDEBAR_CANDIDATE_OVERSAMPLE = 8
+
+
+def _fill_fast_visibility_user_counts(cur, message_cols: set[str], rows: list[dict]) -> None:
+    """Fill ``actual_user_message_count`` for rows the visibility filter dropped.
+
+    The fast window deliberately does not aggregate user-turn counts for every
+    candidate (that ``COUNT(CASE WHEN LOWER(role) = 'user' ...)`` over the whole
+    window is a large slice of the full reader's cost). Rows the visibility
+    filter rejects get one id-bounded ``COUNT`` here — keyed on the lineage tip
+    because a collapsed compression row carries the tip's counts — so the second
+    filter pass reproduces the full projection's decision for default-titled CLI
+    rows and ACP rows, which are visible only when their user turns are known.
+    """
+    if not rows:
+        return
+    ids: list[str] = []
+    for row in rows:
+        sid = row.get('_lineage_tip_id') or row.get('id')
+        if sid:
+            ids.append(str(sid))
+    if not ids:
+        return
+    placeholders = ", ".join("?" for _ in ids)
+    role_clause = " AND LOWER(role) = 'user'" if 'role' in message_cols else ""
+    cur.execute(
+        f"SELECT session_id, COUNT(*) FROM messages "
+        f"WHERE session_id IN ({placeholders}){role_clause} GROUP BY session_id",
+        ids,
+    )
+    counts = {str(row[0]): int(row[1] or 0) for row in cur.fetchall()}
+    for row in rows:
+        sid = row.get('_lineage_tip_id') or row.get('id')
+        row['actual_user_message_count'] = counts.get(str(sid), 0)
+
+
+def read_fast_sidebar_agent_rows(
+    db_path: Path,
+    limit: int | None = 200,
+    log=None,
+    exclude_sources: tuple[str, ...] | None = ("cron", "webui"),
+    include_sources: tuple[str, ...] | None = None,
+    session_ids: tuple[str, ...] | None = None,
+) -> list[dict]:
+    """Bounded first-paint variant of :func:`read_importable_agent_session_rows`.
+
+    Same candidate window (indexed ``COALESCE(s.last_activity_at, s.started_at)
+    DESC, s.started_at DESC`` with the 8x oversample), the same
+    ``_project_agent_session_rows`` compression/continuation collapse, the same
+    ``_with_normalized_source`` flags, the same ``is_cli_session_row_visible``
+    filter and the same subagent-parent re-add — only the user-turn aggregation
+    is deferred:
+
+    * ``actual_message_count`` stays the exact ``COUNT(m.id)`` and
+      ``last_activity`` the exact ``MAX(m.timestamp)`` over the candidate window
+      (one ``LEFT JOIN ... GROUP BY``, exactly like the full reader). The
+      denormalized ``sessions.message_count`` column is NOT a safe proxy for
+      either: supported rows exist with ``message_count > 0`` and no messages
+      (stale counters) and with ``message_count == 0`` and persisted messages,
+      and the projection's compression-tip selection and the ``message_count``
+      fallback both depend on the truthful value.
+    * the ``COUNT(CASE WHEN LOWER(role) = 'user' ...)`` aggregation is not run
+      for the window. Rows the visibility filter drops get one id-bounded
+      follow-up query (``_fill_fast_visibility_user_counts``) and a second
+      filter pass, which reproduces the full projection's decisions for
+      default-titled CLI rows and ACP rows.
+
+    Read-only by construction: no writable fallback, no defensive index
+    self-heal, no tombstone/prune bookkeeping. The full rebuild owns those (the
+    route cache runs it in the background after serving this payload).
+
+    ``limit=None`` (the unbounded projection used by ``all_profiles=1``) is not
+    a fast-path shape and delegates to the full reader.
+    """
+    if limit is None:
+        return read_importable_agent_session_rows(
+            db_path,
+            limit=None,
+            log=log,
+            exclude_sources=exclude_sources,
+            include_sources=include_sources,
+            session_ids=session_ids,
+        )
+    result_limit = max(0, int(limit))
+    if result_limit == 0:
+        return []
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return []
+    log = log or logger
+
+    try:
+        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        # A first-paint read must never create or write the store; the full
+        # rebuild (backgrounded by the route cache) recovers the sidebar.
+        log.debug("fast sidebar read skipped: read-only open failed for %s", db_path)
+        return []
+    with closing(conn):
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(sessions)")
+        session_cols = {row[1] for row in cur.fetchall()}
+        cur.execute("PRAGMA table_info(messages)")
+        message_cols = {row[1] for row in cur.fetchall()}
+        if 'source' not in session_cols:
+            return []
+
+        parent_expr = _optional_col('parent_session_id', session_cols)
+        session_source_expr = _optional_col('session_source', session_cols)
+        ended_expr = _optional_col('ended_at', session_cols)
+        end_reason_expr = _optional_col('end_reason', session_cols)
+        user_id_expr = _optional_col('user_id', session_cols)
+        chat_id_expr = _optional_col('chat_id', session_cols)
+        chat_type_expr = _optional_col('chat_type', session_cols)
+        thread_id_expr = _optional_col('thread_id', session_cols)
+        session_key_expr = _optional_col('session_key', session_cols)
+        origin_chat_id_expr = _optional_col('origin_chat_id', session_cols)
+        origin_user_id_expr = _optional_col('origin_user_id', session_cols)
+        platform_expr = _optional_col('platform', session_cols)
+
+        messages_usable = 'session_id' in message_cols and 'timestamp' in message_cols
+        use_messages_join = messages_usable
+        count_col = 'id' if 'id' in message_cols else 'session_id'
+        if use_messages_join:
+            actual_count_expr = f"COUNT(m.{count_col})"
+            last_activity_expr = "MAX(m.timestamp)"
+            join_clause = "LEFT JOIN messages m ON m.session_id = s.id"
+            group_by_clause = "GROUP BY s.id"
+            display_order_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
+        else:
+            # Older/minimal schemas without a usable messages table: mirror the
+            # full reader's degradation (denormalized counts, started_at order).
+            actual_count_expr = "s.message_count"
+            last_activity_expr = "NULL"
+            join_clause = ""
+            group_by_clause = ""
+            display_order_clause = "ORDER BY s.started_at DESC"
+
+        where_clauses = ["s.source IS NOT NULL"]
+        params: list[object] = []
+        included = ()
+        if include_sources:
+            included = tuple(str(source) for source in include_sources if source)
+            if included:
+                placeholders = ", ".join("?" for _ in included)
+                where_clauses.append(f"s.source IN ({placeholders})")
+                params.extend(included)
+        if exclude_sources:
+            excluded = tuple(str(source) for source in exclude_sources if source)
+            if excluded:
+                placeholders = ", ".join("?" for _ in excluded)
+                where_clauses.append(f"s.source NOT IN ({placeholders})")
+                params.extend(excluded)
+        if session_ids is not None:
+            wanted_ids = tuple(str(sid).strip() for sid in session_ids if str(sid or "").strip())
+            if not wanted_ids:
+                return []
+            placeholders = ", ".join("?" for _ in wanted_ids)
+            where_clauses.append(f"s.id IN ({placeholders})")
+            params.extend(wanted_ids)
+
+        if 'last_activity_at' in session_cols:
+            candidate_order_clause = (
+                "ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC, s.started_at DESC"
+            )
+        elif messages_usable:
+            # Older schemas without the denormalized column: the exact
+            # correlated key is the pre-Slice-D candidate ordering.
+            candidate_order_clause = (
+                "ORDER BY COALESCE((SELECT MAX(mx.timestamp) FROM messages mx "
+                "WHERE mx.session_id = s.id), s.started_at) DESC, s.started_at DESC"
+            )
+        else:
+            candidate_order_clause = "ORDER BY s.started_at DESC"
+
+        candidate_limit = max(result_limit * FAST_SIDEBAR_CANDIDATE_OVERSAMPLE, result_limit)
+        cur.execute(
+            f"""
+            WITH candidates AS (
+                SELECT s.id
+                FROM sessions s
+                WHERE {' AND '.join(where_clauses)}
+                {candidate_order_clause}
+                LIMIT ?
+            )
+            SELECT s.id, s.title, s.model, s.message_count,
+                   s.started_at, s.source,
+                   {session_source_expr},
+                   {user_id_expr},
+                   {chat_id_expr},
+                   {chat_type_expr},
+                   {thread_id_expr},
+                   {session_key_expr},
+                   {origin_chat_id_expr},
+                   {origin_user_id_expr},
+                   {platform_expr},
+                   {parent_expr},
+                   {ended_expr},
+                   {end_reason_expr},
+                   {actual_count_expr} AS actual_message_count,
+                   {last_activity_expr} AS last_activity,
+                   NULL AS actual_user_message_count
+            FROM sessions s
+            JOIN candidates c ON c.id = s.id
+            {join_clause}
+            {group_by_clause}
+            {display_order_clause}
+            """,
+            [*params, candidate_limit],
+        )
+        projected = _project_agent_session_rows([dict(row) for row in cur.fetchall()])
+        projected = [_with_normalized_source(row) for row in projected]
+
+        visible: list[dict] = []
+        hidden: list[dict] = []
+        for row in projected:
+            (visible if is_cli_session_row_visible(row) else hidden).append(row)
+        if hidden:
+            _fill_fast_visibility_user_counts(cur, message_cols, hidden)
+            recovered = [row for row in hidden if is_cli_session_row_visible(row)]
+            if recovered:
+                visible.extend(recovered)
+                # Restore the projection's exact-recency order after the
+                # recovered rows were appended out of order.
+                visible.sort(
+                    key=lambda row: _as_score(row.get('last_activity'), row.get('started_at')),
+                    reverse=True,
+                )
+        projected = visible
+        selected = projected[:result_limit]
+
+    # Same subagent re-add as the full reader: a leaf renders as a child only
+    # when its parent row is in the same payload. Bounded by the candidate
+    # window (``by_id`` only holds projected candidates), so an ancestor older
+    # than the oversample stays unresolved exactly as in the full reader.
+    have = {row.get('id') for row in selected}
+    by_id = {row.get('id'): row for row in projected if row.get('id')}
+    pending = list(selected)
+    while pending:
+        row = pending.pop()
+        if str(row.get('raw_source') or row.get('source') or '').strip().lower() != 'subagent':
+            continue
+        parent_id = row.get('parent_session_id')
+        if not parent_id or parent_id in have:
+            continue
+        parent = by_id.get(parent_id)
+        if parent is None:
+            continue
+        if str(parent.get('raw_source') or parent.get('source') or '').strip().lower() != 'subagent':
+            continue
+        selected.append(parent)
+        have.add(parent_id)
+        pending.append(parent)
+    return selected
+
+
 def _lineage_report_row(row: dict, role: str) -> dict:
     updated_at = row.get('ended_at') if row.get('ended_at') is not None else row.get('started_at')
     return {
