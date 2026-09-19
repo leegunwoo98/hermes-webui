@@ -3029,6 +3029,32 @@ def _hidden_archived_sidebar_reference_sessions(
     return references
 
 
+def _drain_session_list_cache_rebuilds(timeout: float = 5.0) -> None:
+    """Wait (bounded) for in-flight background session-list rebuilds.
+
+    Test-isolation helper. Slice C serves the fast first paint on cold misses
+    and rebuilds the full payload on a background thread, so a rebuild started
+    by one request can still be running while a later test monkeypatches route
+    internals (``all_sessions``, ``_enrich_sidebar_lineage_metadata``, ...).
+    The stray rebuild would then record its builder/enrichment calls into that
+    test's spies. Draining before each test body keeps the suite hermetic.
+    Returns as soon as nothing is in flight; never raises.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        try:
+            with _SESSIONS_CACHE_LOCK:
+                pending = [ev for ev in _SESSIONS_CACHE_INFLIGHT.values() if not ev.is_set()]
+        except Exception:
+            return
+        if not pending:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        pending[0].wait(min(0.05, remaining))
+
+
 def _start_session_list_cache_background_rebuild(key: tuple, event, builder) -> None:
     """Build ``builder()`` on a daemon thread and store it under ``key``.
 
