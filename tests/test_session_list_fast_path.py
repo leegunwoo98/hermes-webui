@@ -451,6 +451,68 @@ def test_fast_payload_window_keeps_exact_counts_and_skips_user_turn_aggregation(
     )
 
 
+def test_fast_payload_counts_exclude_claude_code_jsonl_rows_by_design(monkeypatch, tmp_path):
+    """The documented count divergence: JSONL-scan rows exist only in the full
+    payload's CLI list. The fast payload must not run the scan, so its
+    cli_count/cli_session_count cover the bounded state.db window only — and the
+    client-read visible rows are unaffected."""
+    _install_fixture(monkeypatch, tmp_path)
+
+    jsonl_row = {
+        "session_id": "claude_code_deadbeefdeadbeefdeadbeef",
+        "title": "JSONL transcript",
+        "workspace": "/tmp/fixture-workspace",
+        "model": "claude-code",
+        "message_count": 4,
+        "created_at": T + 3000,
+        "updated_at": T + 3010,
+        "pinned": False,
+        "archived": False,
+        "project_id": None,
+        "profile": "default",
+        "source_tag": "claude_code",
+        "raw_source": "claude_code",
+        "session_source": "external_agent",
+        "source_label": "Claude Code",
+        "is_cli_session": True,
+        "read_only": True,
+    }
+    monkeypatch.setattr(
+        models, "get_claude_code_sessions", lambda: [dict(jsonl_row)], raising=False,
+    )
+
+    full = _build_full()
+    fast = _build_fast()
+
+    assert "claude_code_deadbeefdeadbeefdeadbeef" in {r["session_id"] for r in full["sessions"]}
+    assert "claude_code_deadbeefdeadbeefdeadbeef" not in {r["session_id"] for r in fast["sessions"]}
+    # The JSONL row adds exactly one to the full payload's CLI-for-settings
+    # count; the fast payload's count covers the bounded state.db window only.
+    assert full["cli_session_count"] == fast["cli_session_count"] + 1
+    assert fast["cli_session_count"] > 0  # the fixture's own CLI-classified rows
+    # Visible rows still match for the state.db-backed sessions.
+    full_ids = {r["session_id"] for r in full["sessions"] if not r["session_id"].startswith("claude_code_")}
+    fast_ids = {r["session_id"] for r in fast["sessions"]}
+    assert full_ids == fast_ids
+
+
+def test_fast_window_loader_never_runs_the_jsonl_scan_even_when_asked(monkeypatch, tmp_path):
+    """Defense in depth: ``include_claude_code=True`` must not re-enable the
+    unbounded JSONL walk on a fast window (the loader forces the skip)."""
+    _install_fixture(monkeypatch, tmp_path)
+    calls = []
+
+    def _boom():
+        calls.append("scan")
+        raise AssertionError("the JSONL scan must never run for fast_window=True")
+
+    monkeypatch.setattr(models, "get_claude_code_sessions", _boom, raising=False)
+    rows = models.get_cli_sessions(include_claude_code=True, fast_window=True)
+    assert calls == []
+    assert rows  # the bounded state.db window still returns rows
+    assert not any(str(r.get("session_id", "")).startswith("claude_code_") for r in rows)
+
+
 def test_fast_payload_is_bounded_and_fills_user_counts_lazily(monkeypatch, tmp_path):
     """The user-turn fallback query must only cover rows dropped by the
     visibility filter, never the whole candidate window."""

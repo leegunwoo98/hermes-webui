@@ -6207,6 +6207,27 @@ def _read_state_db_sidebar_overrides(
             return overrides
 
 
+def _call_apply_sidebar_state_db_overrides(
+    sessions: list[dict], *, include_message_counts: bool = True
+) -> None:
+    """Call ``_apply_sidebar_state_db_overrides``, tolerating the historical
+    one-arg signature.
+
+    Focused tests and third-party callers sometimes monkeypatch the applier
+    with the pre-``include_message_counts`` signature; the counts flag is then
+    dropped and the callable's own behavior stands (the same tolerance the
+    sidebar route applies to ``all_sessions``/``get_cli_sessions``).
+    """
+    if _callable_accepts_kwarg(
+        _apply_sidebar_state_db_overrides, "include_message_counts"
+    ):
+        _apply_sidebar_state_db_overrides(
+            sessions, include_message_counts=include_message_counts
+        )
+        return
+    _apply_sidebar_state_db_overrides(sessions)
+
+
 def _apply_sidebar_state_db_overrides(
     sessions: list[dict],
     *,
@@ -6539,7 +6560,7 @@ def all_sessions(
                 _enrich_sidebar_lineage_metadata(result)
             else:
                 _diag_stage(diag, "all_sessions.state_db_overrides")
-                _apply_sidebar_state_db_overrides(
+                _call_apply_sidebar_state_db_overrides(
                     result, include_message_counts=state_db_override_counts
                 )
                 _diag_stage(diag, "all_sessions.lineage_metadata_skipped")
@@ -6603,7 +6624,7 @@ def all_sessions(
         _enrich_sidebar_lineage_metadata(result)
     else:
         _diag_stage(diag, "all_sessions.state_db_overrides")
-        _apply_sidebar_state_db_overrides(
+        _call_apply_sidebar_state_db_overrides(
             result, include_message_counts=state_db_override_counts
         )
         _diag_stage(diag, "all_sessions.lineage_metadata_skipped")
@@ -7916,7 +7937,16 @@ def _load_cli_sessions_uncached(
     # session id, and live /api/session thread dumps parked in exactly that
     # scan are what wedged the chat-open path. JSONL ``claude_code_*`` ids are
     # resolved separately by ``_lookup_claude_code_session_row``.
-    if source_filter in (None, CLAUDE_CODE_SOURCE) and include_claude_code and session_ids is None:
+    #
+    # ``fast_window`` implies the same skip: the bounded first-paint read is
+    # read-only and windowed by construction, so the unbounded JSONL walk is
+    # never allowed there regardless of the caller's ``include_claude_code``.
+    if (
+        source_filter in (None, CLAUDE_CODE_SOURCE)
+        and include_claude_code
+        and session_ids is None
+        and not fast_window
+    ):
         try:
             cli_sessions.extend(get_claude_code_sessions())
         except Exception:

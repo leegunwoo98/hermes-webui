@@ -2835,11 +2835,19 @@ def _build_session_list_fast_payload(
     whole-candidate messages JOIN.
 
     Known accepted divergences from the full payload (documented in
-    ``evidence-slice-c.md``): ``actual_message_count`` comes from the
-    denormalized ``sessions.message_count`` column; ``user_message_count`` is
-    only filled for rows the visibility filter dropped; and the state.db
-    ``last_message_at`` overlay for webui rows waits for the background rebuild.
-    None of these fields is read by the sidebar renderer (Slice C C0 list).
+    ``evidence-slice-c.md``):
+
+    * ``user_message_count`` is only filled for rows the visibility filter
+      dropped (the window skips the user-turn CASE);
+    * ``cli_count``/``cli_session_count`` cover only the bounded state.db window:
+      the full payload also counts the Claude Code JSONL scan's rows, which this
+      path must never produce. ``cli_count`` has zero client consumers; the
+      source-tab counts are refreshed by the background full rebuild within its
+      window. Both counts match the full payload whenever no JSONL rows exist
+      (the C3 parity fixture asserts that).
+
+    No client-read row field diverges (probe parity on live data: same ids,
+    same order, zero field diffs).
     """
     if not _session_list_fast_shape_eligible(
         all_profiles=all_profiles,
