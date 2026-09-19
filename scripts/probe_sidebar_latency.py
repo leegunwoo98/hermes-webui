@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Read-only standalone probe for the Slice A CLI-metadata lookup latency.
+"""Read-only standalone probe for the CLI-metadata lookup / sidebar latency.
 
 Measures, against the ACTIVE profile's state.db (same resolution the WebUI
-server uses), the three costs the chat-open path used to pay per
-``_lookup_cli_session_metadata`` call:
+server uses):
 
+  0. the interactive pass cold/warm
+     (``read_importable_agent_session_rows(limit=20, exclude_sources=("cron",
+     "webhook", "kanban"))`` — the sidebar's visible CLI/agent window, and the
+     Slice D candidate-ordering target). Measured FIRST in the process so the
+     first sample is the process's first state.db read (cold); later samples
+     are warm.
   1. the Claude Code JSONL scan alone (``get_claude_code_sessions()``),
   2. the OLD lookup cost: full ``get_cli_sessions()`` projection + a linear
      scan for the sid (exactly what routes.py did before Slice A),
@@ -132,14 +137,51 @@ def main() -> int:
         )
         return 3
 
+    runs = max(1, args.runs)
+
+    # 0) Interactive pass (the sidebar's visible CLI/agent window). Measured
+    # FIRST in the process so sample 1 is the process's first state.db read
+    # (cold); later samples are warm. Pre-Slice-D this pass ordered its
+    # candidate window with a correlated per-row MAX(messages.timestamp)
+    # subquery; after the swap it uses the indexed
+    # COALESCE(s.last_activity_at, s.started_at) key.
+    def interactive_pass():
+        return models.read_importable_agent_session_rows(
+            db_path,
+            limit=models.CLI_VISIBLE_SESSION_LIMIT,
+            exclude_sources=("cron", "webhook", "kanban"),
+        )
+
+    cold_ms = None
+    warm_samples: list[float] = []
+    interactive_rows = 0
+    for sample_index in range(runs):
+        start = time.perf_counter()
+        rows = interactive_pass()
+        elapsed = (time.perf_counter() - start) * 1000.0
+        interactive_rows = len(rows or [])
+        if sample_index == 0:
+            cold_ms = elapsed
+        else:
+            warm_samples.append(elapsed)
+    warm_text = (
+        f"median {statistics.median(warm_samples):8.1f} ms | "
+        f"min {min(warm_samples):8.1f} | max {max(warm_samples):8.1f} | n={len(warm_samples)}"
+        if warm_samples
+        else "n/a (runs=1)"
+    )
+    print(
+        f"interactive pass (limit={models.CLI_VISIBLE_SESSION_LIMIT}): "
+        f"cold {cold_ms:8.1f} ms | warm {warm_text}  rows={interactive_rows}"
+    )
+    print()
+
     sid = args.sid or _pick_newest_interactive_sid(pathlib.Path(db_path))
     if not sid:
         print("no candidate session id found — pass --sid.")
         return 2
     print(f"target sid  : {sid}")
     print()
-
-    runs = max(1, args.runs)
 
     cc_samples, cc_rows = _timed(lambda: models.get_claude_code_sessions(), runs)
     print(f"claude_code JSONL scan      : {_fmt(cc_samples)}  rows={len(cc_rows or [])}")
