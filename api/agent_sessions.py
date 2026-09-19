@@ -722,11 +722,13 @@ def read_importable_agent_session_rows(
                 # Slice D: order the candidate window by the denormalized,
                 # indexed effective-activity key instead of a correlated
                 # per-row MAX(messages.timestamp) subquery. Writers maintain
-                # ``last_activity_at`` alongside ``message_count``, so it
-                # tracks the exact key closely (99.6% of live rows differ by
-                # seconds) and the 8x oversample absorbs the difference — see
-                # the membership-drift audit in
-                # tests/test_session_candidate_ordering_perf.py and the
+                # ``last_activity_at`` alongside ``message_count``. 99.6% of
+                # live rows differ from the exact key at all; the difference is
+                # seconds for most rows but up to ~hours for a handful (live
+                # non-NULL rows: median 28.6 s, p99 490 s, max 10.85 h; NULL
+                # rows falling back to ``started_at``: max 17.77 h), so the 8x
+                # oversample absorbs the drift — see the membership-drift audit
+                # in tests/test_session_candidate_ordering_perf.py and the
                 # comment at ``candidate_limit`` below. The final display
                 # ORDER BY above stays the exact join-based key, so the
                 # visible top-N is unchanged.
@@ -782,12 +784,15 @@ def read_importable_agent_session_rows(
             # key — the denormalized ``COALESCE(last_activity_at, started_at)``
             # expression — only approximates the exact
             # ``COALESCE(MAX(m.timestamp), started_at)`` the final display order
-            # uses: a row whose column lags the join can rank a few places lower
-            # than its exact position, so a tight window could drop it. The 8x
-            # oversample absorbs that drift, audited on the live DB and in the
-            # D0 fixture (tests/test_session_candidate_ordering_perf.py): zero
+            # uses. The bound: a row whose candidate-key rank is worse than the
+            # window is silently dropped from the visible slice (the projection
+            # only ever sees the window). Audited on the live DB and in the D0
+            # fixture (tests/test_session_candidate_ordering_perf.py): zero
             # pipeline top-20/top-160 rows fall outside the 160-row window,
-            # worst top-20 candidate rank 20. It also preserves room for hidden
+            # worst top-20 candidate rank 20 (~140 slots of margin for the
+            # display) and worst top-160 rank exactly 160 — zero slack at the
+            # audit edge, so the oversample is the current headroom, not a
+            # guaranteed bound. The window also preserves room for hidden
             # compression segments or other rows filtered after projection.
             # Widen ``candidate_limit`` if a future data shape shows drift.
             candidate_limit = max(result_limit * 8, result_limit)

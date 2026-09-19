@@ -15,7 +15,9 @@ Measured on the live DB by the Slice D review: 0 excluded / 0 extra at the
 160-row window for the 20-row slice (worst pipeline-top-20 rank by the
 candidate key = 19). Re-verified here in a fixture with realistic
 column-vs-join skew (``last_activity_at`` tracks, but lags,
-``MAX(messages.timestamp)`` by seconds — 99.6% of live rows disagree):
+``MAX(messages.timestamp)``: 99.6% of live rows differ at all — seconds for
+most rows, but up to ~hours for a handful; live non-NULL median 28.6 s /
+p99 490 s / max 10.85 h, NULL-fallback rows up to 17.77 h):
 **0 excluded / 0 extra at the 8x oversample, 18/20 top-20 rank churn**.
 """
 
