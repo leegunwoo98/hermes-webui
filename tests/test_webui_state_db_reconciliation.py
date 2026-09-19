@@ -608,7 +608,10 @@ def test_api_sessions_overlays_webui_state_db_summary_after_desktop_append(monke
 
     # This request observes the change (and kicks the background rebuild) and
     # returns a valid payload; the settled summary lands within the rebuild
-    # window, so assert it becomes visible within a bounded wait.
+    # window, so assert it becomes visible within a bounded wait. Wait for the
+    # SETTLED summary (count AND timestamp): the fast first-paint payload can
+    # overlay the count from the tier-1 state.db column before the messages
+    # aggregation lands, so a count-only wait could stop on a partial refresh.
     second = _GetHandler("/api/sessions?sidebar_source=webui")
     routes.handle_get(second, urlparse(second.path))
     assert second.status == 200
@@ -620,7 +623,7 @@ def test_api_sessions_overlays_webui_state_db_summary_after_desktop_append(monke
         routes.handle_get(poll, urlparse(poll.path))
         assert poll.status == 200
         row = next(row for row in poll.response_json["sessions"] if row["session_id"] == sid)
-        if row["message_count"] == 4:
+        if row["message_count"] == 4 and row["last_message_at"] == 1003.0:
             break
         time.sleep(0.1)
     assert row is not None
