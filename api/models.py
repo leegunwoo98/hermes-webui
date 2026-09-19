@@ -8214,8 +8214,14 @@ def lookup_cli_session_metadata(session_id: str, *, all_profiles: bool = False) 
       bulk window can miss a parent outside its 20-row slice; the targeted walk
       resolves it up to ``CLI_LOOKUP_MAX_ANCESTORS`` levels).
 
-    Known accepted divergence (asserted in tests): a chain ROOT resolves to its
-    own row, while the bulk payload only contains the merged tip row.
+    Known accepted divergences (asserted in tests): a chain ROOT resolves to
+    its own row, while the bulk payload only contains the merged tip row; and
+    for a child whose parent is itself a continuation segment whose chain root
+    lies outside the bulk candidate window, the bulk row stops its lineage walk
+    at the immediate parent while the targeted walk resolves the true chain
+    root — ``parent_title``/``parent_source`` and ``_parent_lineage_root_id``
+    are therefore more faithful here (no lookup consumer reads these fields;
+    the bulk sidebar payload is unaffected).
 
     Returns ``{}`` when nothing matches — including a tombstoned WebUI row,
     which the loader drops exactly like the bulk projection does. The

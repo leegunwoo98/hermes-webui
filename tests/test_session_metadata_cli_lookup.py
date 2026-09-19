@@ -951,7 +951,14 @@ def test_lookup_guard_claude_code_sid_resolves_without_bulk_scan(monkeypatch, tm
 def test_lookup_child_with_parent_outside_window_adds_parent_metadata(monkeypatch, tmp_path):
     """A6 documented divergence (fidelity improvement): when the bulk 20-row
     window drops the parent, the bulk child row has parent_title=None while the
-    chain-aware lookup still resolves it. Everything else must match."""
+    chain-aware lookup still resolves it. Everything else must match.
+
+    ``_parent_lineage_root_id`` is in the ignored set for the same class of
+    case: when the parent is itself a continuation segment whose chain root is
+    outside the bulk candidate window, the bulk row stops the lineage walk at
+    its immediate parent while the targeted walk resolves the true chain root
+    (verified red/green with a chain-of-chain fixture). See the accepted
+    divergences in ``models.lookup_cli_session_metadata``'s docstring."""
     import api.models as models
 
     hermes_home = _pin_fixture_environment(monkeypatch, tmp_path)
@@ -966,7 +973,7 @@ def test_lookup_child_with_parent_outside_window_adds_parent_metadata(monkeypatc
 
     assert row["parent_title"] == "Overflow parent"
     assert row["parent_source"] == "desktop"
-    ignored = {"parent_title", "parent_source"}
+    ignored = {"parent_title", "parent_source", "_parent_lineage_root_id"}
     assert {k: v for k, v in row.items() if k not in ignored} == {
         k: v for k, v in bulk["overflow_child"].items() if k not in ignored
     }
