@@ -3044,6 +3044,13 @@ def _start_session_list_cache_background_rebuild(key: tuple, event, builder) -> 
             rebuild_attempts = 0
             while True:
                 invalidation_stamp = _session_list_cache_invalidation_stamp(key)
+                # Capture the source stamp this payload is BUILT from: storing
+                # it with the store-time stamp would mark a payload built from
+                # an obsolete row set as a fresh hit, and the next request would
+                # serve it without rebuilding (commit-47d8ac94 invariant, up to
+                # the TTL). With the build-time stamp the entry classifies
+                # correctly and the next request re-evaluates.
+                source_stamp = _session_list_cache_source_stamp(key)
                 try:
                     payload = builder()
                 except Exception:
@@ -3056,6 +3063,7 @@ def _start_session_list_cache_background_rebuild(key: tuple, event, builder) -> 
                     and _session_list_cache_set(
                         key,
                         payload,
+                        stamp=source_stamp,
                         expected_invalidation_stamp=invalidation_stamp,
                     )
                 ):

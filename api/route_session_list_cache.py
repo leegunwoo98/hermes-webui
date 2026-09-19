@@ -456,11 +456,29 @@ def _session_list_cache_set(
     key: tuple,
     payload: dict,
     *,
+    stamp=None,
     expected_invalidation_stamp: tuple[int, int] | None = None,
 ) -> bool:
+    """Store ``payload`` under ``key``.
+
+    ``stamp`` defaults to the source stamp read at store time (the historical
+    behavior). The background rebuild passes the stamp its payload was BUILT
+    from instead: re-reading at store time would mark a payload built from an
+    obsolete row set as a fresh cache hit, so the next request would serve it
+    without rebuilding — defeating the commit-47d8ac94 invariant for up to the
+    TTL. With the build-time stamp the entry classifies correctly (structural
+    mismatch → synchronous rebuild; volatile-only → stale-while-revalidate).
+
+    ``expected_invalidation_stamp``, when given, is re-checked under the lock
+    before insertion (a rename/archive/delete clear that lands during
+    projection must not be undone by this stale write); the insert is skipped
+    and ``False`` returned when it moved. Callers that build synchronously
+    never skip the store (no cache starvation under churn).
+    """
     if not isinstance(payload, dict):
         return False
-    stamp = _session_list_cache_resolved_source_stamp(key)
+    if stamp is None:
+        stamp = _session_list_cache_resolved_source_stamp(key)
     bounded = _session_list_cache_bounded_payload(payload)
     with _SESSIONS_CACHE_LOCK:
         # Projection intentionally happens outside the lock so large source rows

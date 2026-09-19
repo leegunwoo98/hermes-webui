@@ -701,6 +701,65 @@ def test_fast_builder_failure_falls_back_to_the_synchronous_full_build(monkeypat
     assert routes._session_list_cache_get(key, allow_stale=True)[0] == _cache_payload("full")
 
 
+def test_background_rebuild_stores_under_the_pre_build_source_stamp(monkeypatch):
+    """A payload built while the source changed must not be stamped fresh.
+
+    The store-time stamp re-read marks a payload built from an obsolete row set
+    as a cache hit, so the next request would serve it without rebuilding —
+    defeating the commit-47d8ac94 invariant for up to the TTL. The background
+    rebuild therefore stores the payload with the stamp it was BUILT from; the
+    next request classifies the entry correctly (structural → synchronous
+    rebuild, volatile → stale-while-revalidate)."""
+    routes._session_list_cache_clear()
+    stamps = [("s0", "v0")]
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: stamps[0])
+    key = _cache_key()
+    started = threading.Event()
+    release = threading.Event()
+
+    def _builder():
+        started.set()
+        release.wait(5.0)
+        stamps[0] = ("s1", "v1")  # the source changes mid-build
+        return _cache_payload("full")
+
+    owner_result = {}
+
+    def _owner():
+        owner_result["payload"] = routes._get_cached_session_list_payload(
+            key=key,
+            builder=_builder,
+            fast_builder=lambda: _cache_payload("fast"),
+        )
+
+    thread = threading.Thread(target=_owner)
+    thread.start()
+    try:
+        assert started.wait(1.0)
+    finally:
+        release.set()
+        thread.join(5.0)
+
+    deadline = time.monotonic() + 5.0
+    entry = None
+    while time.monotonic() < deadline:
+        with routes._SESSIONS_CACHE_LOCK:
+            entry = routes._SESSIONS_CACHE.get(key)
+        if entry is not None:
+            break
+        time.sleep(0.01)
+    assert entry is not None, "the background rebuild must still store the payload"
+    _ts, stored_stamp, payload = entry
+    assert stored_stamp == ("s0", "v0"), (
+        "the background store must keep the pre-build stamp, not the store-time one"
+    )
+    assert payload == _cache_payload("full")
+    cached, is_fresh = routes._session_list_cache_get(key, allow_stale=True)
+    assert cached == _cache_payload("full")
+    assert is_fresh is False
+    assert routes._session_list_cache_stale_reason(key) == "source"
+
+
 @pytest.mark.parametrize("overrides,eligible", [
     ({}, True),
     ({"sidebar_source": "webui"}, True),
