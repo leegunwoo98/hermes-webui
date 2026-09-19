@@ -253,3 +253,221 @@ def test_candidate_window_membership_drift_zero_at_eight_x_oversample(tmp_path):
     visible_ids = [str(row["id"]) for row in visible]
     assert visible_ids == exact_top20
     assert set(visible_ids) <= candidate_set
+
+
+# ---------------------------------------------------------------------------
+# D1 — the candidate-ordering swap itself.
+#
+# The candidate clause becomes ``ORDER BY COALESCE(s.last_activity_at,
+# s.started_at) DESC, s.started_at DESC`` (indexed by
+# ``idx_sessions_effective_activity``); the final display ORDER BY stays
+# ``COALESCE(MAX(m.timestamp), s.started_at)``, so the visible top-N is
+# unchanged. Older schemas without ``last_activity_at`` keep the exact
+# correlated-subquery candidate ordering.
+# ---------------------------------------------------------------------------
+
+# The pre-swap candidate selection, re-implemented as the parity reference.
+_OLD_FORM_VISIBLE_SQL = f"""
+WITH candidates AS (
+    SELECT s.id
+    FROM sessions s
+    WHERE {INTERACTIVE_WHERE}
+    ORDER BY COALESCE(
+        (SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),
+        s.started_at
+    ) DESC,
+    s.started_at DESC
+    LIMIT ?
+)
+SELECT s.id
+FROM sessions s
+JOIN candidates c ON c.id = s.id
+LEFT JOIN messages m ON m.session_id = s.id
+GROUP BY s.id
+ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC
+LIMIT ?
+"""
+
+
+class _RecordingCursor:
+    def __init__(self, cursor, executed):
+        self._cursor = cursor
+        self._executed = executed
+
+    def execute(self, sql, params=()):
+        self._executed.append((sql, tuple(params)))
+        return self._cursor.execute(sql, params)
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class _RecordingConnection:
+    def __init__(self, connection, executed):
+        self._connection = connection
+        self._executed = executed
+
+    def cursor(self):
+        return _RecordingCursor(self._connection.cursor(), self._executed)
+
+    def close(self):
+        return self._connection.close()
+
+    def commit(self):
+        return self._connection.commit()
+
+    @property
+    def row_factory(self):
+        return self._connection.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._connection.row_factory = value
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+def _record_connect(monkeypatch, executed):
+    real_connect = agent_sessions.sqlite3.connect
+
+    def recording_connect(*args, **kwargs):
+        return _RecordingConnection(real_connect(*args, **kwargs), executed)
+
+    monkeypatch.setattr(agent_sessions.sqlite3, "connect", recording_connect)
+
+
+def test_interactive_candidate_window_orders_by_indexed_effective_activity(monkeypatch, tmp_path):
+    """D1: the candidate window is ordered by the denormalized, indexed
+    ``COALESCE(s.last_activity_at, s.started_at)`` key with the
+    ``s.started_at DESC`` tie-breaker. The correlated per-row
+    ``MAX(mx.timestamp)`` subquery is gone from the candidate clause, and the
+    final display ORDER BY stays the exact join-based key."""
+    db = tmp_path / "state.db"
+    _build_state_db(db)
+
+    executed = []
+    _record_connect(monkeypatch, executed)
+    rows = _interactive_rows(db, limit=20)
+    assert rows
+
+    candidate_calls = [(sql, params) for sql, params in executed if "WITH candidates AS" in sql]
+    assert candidate_calls, "expected the candidate-window projection SQL"
+    candidate_sql, candidate_params = candidate_calls[-1]
+
+    # The swap: indexed expression key + the started_at DESC tie-breaker.
+    assert "COALESCE(s.last_activity_at, s.started_at) DESC" in candidate_sql
+    assert "s.started_at DESC" in candidate_sql
+    # The old correlated per-row subquery is gone from the candidate clause.
+    assert "SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id" not in candidate_sql
+    # The final display ordering stays exact (join-based MAX), unchanged.
+    assert "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC" in candidate_sql
+
+    # ... and the plan actually uses the expression index, with no correlated
+    # scalar subquery left anywhere in the statement.
+    conn = sqlite3.connect(str(db))
+    try:
+        plan = [str(row[-1]) for row in conn.execute("EXPLAIN QUERY PLAN " + candidate_sql, candidate_params)]
+    finally:
+        conn.close()
+    assert any("idx_sessions_effective_activity" in line for line in plan), plan
+    assert not any("CORRELATED" in line for line in plan), plan
+
+
+def test_swapped_candidate_selection_keeps_visible_top_n_parity_under_skew(tmp_path):
+    """D1(a): with the column and the join disagreeing by seconds (the live
+    shape — 99.6% of rows), the swapped candidate selection yields the same
+    visible top-N as the pre-swap correlated-subquery form."""
+    db = tmp_path / "state.db"
+    _build_state_db(db)
+    conn = sqlite3.connect(str(db))
+    try:
+        exact_top20 = _top_ids(conn, EXACT_ORDER, 20)
+        candidate_order_top20 = _top_ids(conn, CANDIDATE_ORDER, 20)
+        old_form_visible = [str(row[0]) for row in conn.execute(_OLD_FORM_VISIBLE_SQL, (160, 20))]
+    finally:
+        conn.close()
+
+    # Fixture sanity: the candidate key genuinely reorders the top-20, so the
+    # parity assertion is not vacuous.
+    assert candidate_order_top20 != exact_top20
+
+    visible_ids = [str(row["id"]) for row in _interactive_rows(db, limit=20)]
+
+    # Same visible top-N as the old form, in the same (exact-key) order.
+    assert visible_ids == old_form_visible
+    assert visible_ids == exact_top20
+
+
+def test_candidate_ordering_falls_back_without_last_activity_column(monkeypatch, tmp_path):
+    """Older state.db schemas have no ``sessions.last_activity_at`` column (all
+    live DBs do). The pass must keep working there — never referencing the
+    missing column — and keep the exact correlated-subquery candidate ordering,
+    so a session resumed with a late message still surfaces on top."""
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT,
+            session_source TEXT,
+            title TEXT,
+            model TEXT,
+            started_at REAL NOT NULL,
+            message_count INTEGER DEFAULT 0,
+            parent_session_id TEXT,
+            ended_at REAL,
+            end_reason TEXT
+        );
+        CREATE TABLE messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT,
+            role TEXT,
+            content TEXT,
+            timestamp REAL
+        );
+        CREATE INDEX idx_messages_session ON messages(session_id, timestamp);
+        """
+    )
+    rows = [
+        # sid, started_at, message timestamps
+        ("old-root", 1000.0, [1000.0, 5000.0]),
+        ("old-newer-start", 2000.0, [2000.0]),
+        ("old-mid", 1500.0, [1500.0]),
+    ]
+    for sid, started_at, timestamps in rows:
+        conn.execute(
+            "INSERT INTO sessions (id, source, session_source, title, model, started_at,"
+            " message_count, parent_session_id, ended_at, end_reason)"
+            " VALUES (?, 'desktop', 'desktop', ?, 'test-model', ?, 1, NULL, NULL, NULL)",
+            (sid, f"title {sid}", started_at),
+        )
+        for index, timestamp in enumerate(timestamps):
+            conn.execute(
+                "INSERT INTO messages (id, session_id, role, content, timestamp)"
+                " VALUES (?, ?, 'user', 'hi', ?)",
+                (f"{sid}-msg-{index}", sid, timestamp),
+            )
+    conn.commit()
+    conn.close()
+
+    executed = []
+    _record_connect(monkeypatch, executed)
+    result_ids = [str(row["id"]) for row in _interactive_rows(db, limit=20)]
+
+    # Exact recency: the early-started session with the late message ranks first.
+    assert result_ids == ["old-root", "old-newer-start", "old-mid"]
+    # The missing column is never referenced (it would raise OperationalError,
+    # which the caller swallows into an empty sidebar).
+    assert all("last_activity_at" not in sql for sql, _params in executed)
+

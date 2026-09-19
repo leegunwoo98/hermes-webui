@@ -718,13 +718,35 @@ def read_importable_agent_session_rows(
             candidate_order_clause = "ORDER BY COALESCE(lm.last_message_at, s.started_at) DESC, s.started_at DESC"
         elif use_messages_join and messages_has_timestamp:
             order_by_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
-            candidate_order_clause = (
-                "ORDER BY COALESCE(\n"
-                "                        (SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),\n"
-                "                        s.started_at\n"
-                "                    ) DESC,\n"
-                "                    s.started_at DESC"
-            )
+            if 'last_activity_at' in session_cols:
+                # Slice D: order the candidate window by the denormalized,
+                # indexed effective-activity key instead of a correlated
+                # per-row MAX(messages.timestamp) subquery. Writers maintain
+                # ``last_activity_at`` alongside ``message_count``, so it
+                # tracks the exact key closely (99.6% of live rows differ by
+                # seconds) and the 8x oversample absorbs the difference — see
+                # the membership-drift audit in
+                # tests/test_session_candidate_ordering_perf.py and the
+                # comment at ``candidate_limit`` below. The final display
+                # ORDER BY above stays the exact join-based key, so the
+                # visible top-N is unchanged.
+                candidate_order_clause = (
+                    "ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC,\n"
+                    "                    s.started_at DESC"
+                )
+            else:
+                # Older state.db schemas have no ``last_activity_at`` column:
+                # keep the exact correlated-subquery candidate ordering (the
+                # pre-Slice-D behaviour) instead of referencing a missing
+                # column, which would raise OperationalError and (through the
+                # caller's guard) empty the sidebar.
+                candidate_order_clause = (
+                    "ORDER BY COALESCE(\n"
+                    "                        (SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),\n"
+                    "                        s.started_at\n"
+                    "                    ) DESC,\n"
+                    "                    s.started_at DESC"
+                )
 
         select_sql = f"""
             SELECT s.id, s.title, s.model, s.message_count,
@@ -755,8 +777,19 @@ def read_importable_agent_session_rows(
             # slicing in Python. The candidate ordering must include the latest
             # message timestamp, not only ``started_at``: long-lived CLI sessions
             # can be resumed days later and should still surface at the top.
-            # Oversampling preserves room for hidden compression segments or
-            # other rows filtered after projection.
+            #
+            # The window is oversampled 8x (``limit * 8``) because its ordering
+            # key — the denormalized ``COALESCE(last_activity_at, started_at)``
+            # expression — only approximates the exact
+            # ``COALESCE(MAX(m.timestamp), started_at)`` the final display order
+            # uses: a row whose column lags the join can rank a few places lower
+            # than its exact position, so a tight window could drop it. The 8x
+            # oversample absorbs that drift, audited on the live DB and in the
+            # D0 fixture (tests/test_session_candidate_ordering_perf.py): zero
+            # pipeline top-20/top-160 rows fall outside the 160-row window,
+            # worst top-20 candidate rank 20. It also preserves room for hidden
+            # compression segments or other rows filtered after projection.
+            # Widen ``candidate_limit`` if a future data shape shows drift.
             candidate_limit = max(result_limit * 8, result_limit)
             if latest_messages_cte:
                 candidate_cte = (
