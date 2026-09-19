@@ -170,7 +170,8 @@ def _make_state_db(path: Path, sessions, *, last_activity_lag=None, last_activit
     conn.close()
 
 
-def _install_fixture(monkeypatch, tmp_path, *, last_activity_lag=None, last_activity_null=()):
+def _install_fixture(monkeypatch, tmp_path, *, last_activity_lag=None, last_activity_null=(),
+                     extra_sessions=(), extra_sidecars=()):
     import api.profiles as profiles
 
     state_dir = tmp_path / "webui"
@@ -205,12 +206,12 @@ def _install_fixture(monkeypatch, tmp_path, *, last_activity_lag=None, last_acti
     }), encoding="utf-8")
 
     _make_state_db(
-        tmp_path / "state.db", _FIXTURE_SESSIONS,
+        tmp_path / "state.db", [*_FIXTURE_SESSIONS, *extra_sessions],
         last_activity_lag=last_activity_lag, last_activity_null=last_activity_null,
     )
 
     index_entries = []
-    for sid, title, messages, extra in _FIXTURE_SIDECARS:
+    for sid, title, messages, extra in [*_FIXTURE_SIDECARS, *extra_sidecars]:
         sidecar = {
             "session_id": sid,
             "title": title,
@@ -364,6 +365,57 @@ def test_fast_payload_parity_under_candidate_key_drift(monkeypatch, tmp_path):
     assert any(
         r["session_id"] == "arch-parent" for r in fast["sidebar_reference_sessions"]
     )
+
+
+def test_fast_payload_parity_binds_the_candidate_window(monkeypatch, tmp_path):
+    """Resumed-old rows must survive the candidate window, and the window must
+    stay oversampled.
+
+    The base fixture (21 state.db candidates, 16 visible rows) cannot see a
+    broken candidate ordering key or a collapsed window: every candidate fits
+    either way. On real data a long-lived session resumed days later is exactly
+    the row a ``started_at`` candidate key loses (its ``last_activity_at`` /
+    exact ``MAX(m.timestamp)`` is recent while ``started_at`` is old), and the
+    8x oversample is the headroom that keeps its exact-recency rank inside the
+    window.
+
+    Fixture: 200 fillers newer by ``started_at`` plus 3 resumed-old rows whose
+    ``last_activity_at`` lags the exact key by ~65 min — candidate rank ~110 of
+    203 (inside the 160-row window, outside any 1x window), exact recency
+    top-3. A ``started_at`` candidate key drops the resumed rows from the
+    window entirely; a ``limit * 1`` window excludes them from the candidate
+    set. Both make parity fail (verified by mutation on a /tmp copy), so this
+    test pins the window size and the key, not just the SQL text.
+    """
+    fillers = [
+        (f"filler-{i:03d}", "cli", f"Filler {i:03d}", T + 1000 + i, None, None, None, 1, {},
+         [("user", T + 1000 + i)])
+        for i in range(200)
+    ]
+    resumed = []
+    lag = {}
+    for k in range(3):
+        sid = f"resumed-old-{k}"
+        resumed.append((sid, "cli", f"Resumed old {k}", T + 10 + k, None, None, None, 2, {},
+                        [("user", T + 5000 + k), ("assistant", T + 5001 + k)]))
+        # last_activity_at = (T + 5001 + k) - lag = T + 1100 for all three:
+        # a recent-but-lagging candidate key with an exact recency far newer.
+        lag[sid] = 3901.0 + k
+    _install_fixture(
+        monkeypatch, tmp_path, extra_sessions=fillers + resumed, last_activity_lag=lag,
+    )
+    full = _build_full()
+    fast = _build_fast()
+    _assert_payload_parity(full, fast)
+    ids = [r["session_id"] for r in fast["sessions"]]
+    # The resumed rows are in the visible slice (top-3 by exact recency); if the
+    # fixture ever stops producing that shape this assertion goes red first.
+    assert {"resumed-old-0", "resumed-old-1", "resumed-old-2"} <= set(ids)
+    assert ids[:3] == ["resumed-old-2", "resumed-old-1", "resumed-old-0"]
+    # The newest fillers fill the rest of the capped CLI slice in exact-recency
+    # order; the oldest fillers never surface.
+    assert ids.index("filler-199") < ids.index("filler-198")
+    assert "filler-000" not in ids
 
 
 def test_fast_payload_keeps_untitled_cli_and_acp_rows_visible(monkeypatch, tmp_path):
