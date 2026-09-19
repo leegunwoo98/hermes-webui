@@ -116,6 +116,78 @@ def test_read_importable_rows_session_ids_beats_recency_window(tmp_path):
     assert [row["id"] for row in oldest] == ["telegram_session"]
 
 
+def test_load_cli_sessions_uncached_threads_session_ids_through_all_passes(monkeypatch, tmp_path):
+    """A2: the targeted id set reaches every projection pass (cron/webhook/kanban
+    rows are reachable only through their dedicated passes)."""
+    import api.models as models
+
+    db = tmp_path / "state.db"
+    db.write_text("", encoding="utf-8")
+    calls = []
+
+    def fake_read_rows(_db_path, **kwargs):
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(models, "read_importable_agent_session_rows", fake_read_rows)
+    monkeypatch.setattr(
+        models,
+        "get_claude_code_sessions",
+        lambda: (_ for _ in ()).throw(AssertionError("targeted reads must not scan Claude Code JSONL")),
+    )
+
+    result = models._load_cli_sessions_uncached(
+        tmp_path, db, _cli_profile=None, session_ids=("target_session",)
+    )
+
+    assert result == []
+    assert len(calls) == 4
+    assert all(call.get("session_ids") == ("target_session",) for call in calls)
+    assert [call["include_sources"] for call in calls] == [None, ("cron",), ("webhook",), ("kanban",)]
+
+
+def test_targeted_load_returns_only_requested_rows_and_skips_claude_code_scan(monkeypatch, tmp_path):
+    import api.models as models
+
+    db = tmp_path / "state.db"
+    _make_multi_source_state_db(db)
+    monkeypatch.setattr(models, "get_last_workspace", lambda: tmp_path)
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
+    cc_calls = []
+
+    def fake_claude_code_sessions(*_args, **_kwargs):
+        cc_calls.append(1)
+        return [{"session_id": "claude_code_should_not_appear", "source_tag": "claude_code"}]
+
+    monkeypatch.setattr(models, "get_claude_code_sessions", fake_claude_code_sessions)
+
+    rows = models._load_cli_sessions_uncached(
+        tmp_path, db, _cli_profile=None, session_ids=("telegram_session",)
+    )
+
+    assert cc_calls == []
+    assert [row["session_id"] for row in rows] == ["telegram_session"]
+    assert rows[0]["source_tag"] == "telegram"
+
+
+def test_load_cli_sessions_uncached_default_still_scans_claude_code(monkeypatch, tmp_path):
+    """session_ids=None (the default) preserves the existing bulk behaviour."""
+    import api.models as models
+
+    db = tmp_path / "state.db"
+    db.write_text("", encoding="utf-8")
+    monkeypatch.setattr(models, "read_importable_agent_session_rows", lambda *_a, **_k: [])
+    monkeypatch.setattr(
+        models,
+        "get_claude_code_sessions",
+        lambda: [{"session_id": "claude_code_bulk", "source_tag": "claude_code"}],
+    )
+
+    rows = models._load_cli_sessions_uncached(tmp_path, db, _cli_profile=None)
+
+    assert [row["session_id"] for row in rows] == ["claude_code_bulk"]
+
+
 class _FakeSession:
     def __init__(self, *, is_cli_session=False, session_source=None, source_tag=None):
         self.session_id = "native_webui_001"

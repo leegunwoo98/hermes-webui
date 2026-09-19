@@ -7724,9 +7724,16 @@ def _load_cli_sessions_uncached(
     webhook_project_limit: int | None | bool = WEBHOOK_PROJECT_CHIP_LIMIT,
     kanban_project_limit: int | None | bool = KANBAN_PROJECT_CHIP_LIMIT,
     include_claude_code: bool = True,
+    session_ids: tuple[str, ...] | None = None,
 ) -> list:
     cli_sessions = []
-    if source_filter in (None, CLAUDE_CODE_SOURCE) and include_claude_code:
+    # A targeted read (``session_ids`` set) must never pay the global Claude
+    # Code JSONL scan: the scan walks every ``~/.claude/projects`` transcript
+    # (lstat + parse, up to CLAUDE_CODE_MAX_FILES) and cannot be narrowed by
+    # session id, and live /api/session thread dumps parked in exactly that
+    # scan are what wedged the chat-open path. JSONL ``claude_code_*`` ids are
+    # resolved separately by ``_lookup_claude_code_session_row``.
+    if source_filter in (None, CLAUDE_CODE_SOURCE) and include_claude_code and session_ids is None:
         try:
             cli_sessions.extend(get_claude_code_sessions())
         except Exception:
@@ -7839,6 +7846,7 @@ def _load_cli_sessions_uncached(
         # (especially kanban) from evicting every CLI/TUI/ACP conversation.
         exclude_sources=("cron", "webhook", "kanban") if source_filter is None else None,
         include_sources=None if source_filter is None else (source_filter,),
+        session_ids=session_ids,
     ):
         sid = row['id']
         raw_ts = row['last_activity'] or row['started_at']
@@ -7926,6 +7934,7 @@ def _load_cli_sessions_uncached(
                 log=logger,
                 exclude_sources=None,
                 include_sources=("cron",),
+                session_ids=session_ids,
             ):
                 sid = row['id']
                 if sid in existing_sids:
@@ -7994,6 +8003,7 @@ def _load_cli_sessions_uncached(
                 log=logger,
                 exclude_sources=None,
                 include_sources=("webhook",),
+                session_ids=session_ids,
             ):
                 sid = row['id']
                 if sid in existing_sids:
@@ -8059,6 +8069,7 @@ def _load_cli_sessions_uncached(
                 log=logger,
                 exclude_sources=None,
                 include_sources=("kanban",),
+                session_ids=session_ids,
             ):
                 sid = row['id']
                 if sid in existing_sids:
