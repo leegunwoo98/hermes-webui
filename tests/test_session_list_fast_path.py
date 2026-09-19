@@ -513,6 +513,35 @@ def test_fast_window_loader_never_runs_the_jsonl_scan_even_when_asked(monkeypatc
     assert not any(str(r.get("session_id", "")).startswith("claude_code_") for r in rows)
 
 
+def test_fast_reader_degrades_without_a_messages_table(monkeypatch, tmp_path):
+    """Older/minimal schemas (no usable messages table) must mirror the full
+    reader's degradation: denormalized counts, started_at recency."""
+    import api.agent_sessions as agent_sessions
+
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, title TEXT, model TEXT, "
+        "started_at REAL, message_count INTEGER, last_activity_at REAL, parent_session_id TEXT, "
+        "end_reason TEXT, ended_at REAL)"
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, title, started_at, message_count, last_activity_at) "
+        "VALUES ('legacy-cli', 'cli', 'Legacy session', ?, 3, ?)",
+        (T + 10, T + 12),
+    )
+    conn.commit()
+    conn.close()
+
+    rows = agent_sessions.read_fast_sidebar_agent_rows(
+        db_path, limit=20, exclude_sources=("cron", "webhook", "kanban"),
+    )
+    assert [row["id"] for row in rows] == ["legacy-cli"]
+    assert rows[0]["actual_message_count"] == 3
+    assert rows[0]["last_activity"] is None
+    assert rows[0]["message_count"] == 3
+
+
 def test_fast_payload_is_bounded_and_fills_user_counts_lazily(monkeypatch, tmp_path):
     """The user-turn fallback query must only cover rows dropped by the
     visibility filter, never the whole candidate window."""
