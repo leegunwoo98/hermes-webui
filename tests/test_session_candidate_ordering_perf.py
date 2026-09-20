@@ -730,3 +730,64 @@ def test_fast_candidate_union_is_bounded_and_seeded_by_pre_windows(monkeypatch, 
     assert any("UNION" in line or "MERGE" in line for line in plan), plan
 
 
+# ---------------------------------------------------------------------------
+# The documented no-index fallback (``_fast_candidate_union_cte`` → (None, [])).
+#
+# The union's session-row seeds must each be an index-ordered bounded read, so a
+# store without the agent's standard sessions indexes (but WITH a usable
+# ``messages.timestamp``) takes the plain exact-key window over all qualifying
+# sessions — the pre-union behavior. Every legacy fixture in this repo omits
+# ``messages.timestamp`` (or the whole messages table) and therefore never
+# reaches that branch; this store shape is the one that does.
+# ---------------------------------------------------------------------------
+
+
+def _build_no_sessions_index_db(path: Path) -> None:
+    """The Slice D fixture with both standard sessions indexes dropped."""
+    _build_state_db(path)
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("DROP INDEX IF EXISTS idx_sessions_effective_activity")
+        conn.execute("DROP INDEX IF EXISTS idx_sessions_started")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_fast_reader_without_sessions_indexes_uses_the_exact_window_fallback(monkeypatch, tmp_path):
+    """No sessions indexes: the fast reader falls back to the plain exact-key
+    window with its OWN bindings and returns the full reader's rows.
+
+    Regression (round-2 defect A-D1): the fallback reused the union's parameter
+    list — which is ``[]`` exactly when the union is declined — while its SQL
+    still binds ``where_sql`` + ``LIMIT ?``. The statement raised
+    ``sqlite3.ProgrammingError: Incorrect number of bindings supplied``, and the
+    models-layer fast loader swallowed that into an empty CLI list, so the fast
+    first paint silently dropped every CLI/agent row on such a store.
+    """
+    db = tmp_path / "state.db"
+    _build_no_sessions_index_db(db)
+
+    executed = []
+    _record_connect(monkeypatch, executed)
+    fast = _fast_interactive_rows(db, limit=20)
+    full = _interactive_rows(db, limit=20)
+
+    assert [row["id"] for row in fast] == [row["id"] for row in full]
+    assert len(fast) == 20
+
+    window_calls = [(sql, params) for sql, params in executed if "candidates AS (" in sql]
+    assert window_calls, "expected the fast candidate-window statement"
+    sql, params = window_calls[-1]
+    normalized = " ".join(sql.split())
+    # The union is unavailable on this store: the plain exact-key window over
+    # all qualifying sessions runs instead (no pre-window seeds, no union).
+    assert "pre_activity AS" not in normalized
+    assert "s.id IN (" not in normalized
+    assert "LIMIT ?" in normalized
+    # Its bindings are its own (where-params + the window LIMIT), never the
+    # union's: a param-count drift here is the regression that made the fast
+    # first paint serve zero CLI rows. The placeholder count is asserted
+    # directly so any re-break of the binding list fails here.
+    assert list(params) == ["cron", "webhook", "kanban", 160]
+    assert normalized.count("?") == len(params)

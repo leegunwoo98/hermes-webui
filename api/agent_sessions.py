@@ -1204,7 +1204,7 @@ def read_fast_sidebar_agent_rows(
         candidates_cte = None
         candidate_params: list[object] = [*params, candidate_limit]
         if use_messages_join and messages_has_timestamp:
-            candidates_cte, candidate_params = _fast_candidate_union_cte(
+            union_cte, union_params = _fast_candidate_union_cte(
                 where_sql=where_sql,
                 where_params=params,
                 session_cols=session_cols,
@@ -1212,6 +1212,14 @@ def read_fast_sidebar_agent_rows(
                 candidate_order_clause=candidate_order_clause,
                 candidate_limit=candidate_limit,
             )
+            if union_cte is not None:
+                candidates_cte, candidate_params = union_cte, union_params
+            # The helper declines the union (``(None, [])``) when the store has
+            # none of the agent's standard sessions indexes to seed it with: the
+            # plain exact-key window below then keeps ITS OWN bindings. Taking
+            # the union's params unconditionally bound ``[]`` against a
+            # statement with ``where_sql`` + ``LIMIT ?`` placeholders and raised
+            # ``Incorrect number of bindings supplied`` on exactly those stores.
         if candidates_cte is None:
             candidates_cte = (
                 "WITH candidates AS (\n"

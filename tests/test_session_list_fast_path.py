@@ -894,6 +894,60 @@ def test_fast_reader_candidate_window_ignores_last_activity_without_timestamps(t
     assert [row["id"] for row in fast] == ["edge-hot", "edge-b"]
 
 
+# ── no-index store: the fast CLI window must degrade, never disappear ────────
+
+def _drop_sessions_indexes(db_path: Path) -> None:
+    """Drop the two indexes the union's session-row seeds require."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DROP INDEX IF EXISTS idx_sessions_effective_activity")
+        conn.execute("DROP INDEX IF EXISTS idx_sessions_started")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_fast_payload_cli_rows_match_the_full_builder_without_sessions_indexes(monkeypatch, tmp_path):
+    """A store with ``messages.timestamp`` but no standard sessions indexes:
+    the fast payload's CLI/agent rows ARE the full builder's.
+
+    Regression (round-2 defect A-D1): the documented no-index fallback (the
+    plain exact-key window) raised ``sqlite3.ProgrammingError: Incorrect number
+    of bindings supplied`` because it reused the union's parameter list, and
+    ``get_cli_sessions(fast_window=True)`` swallowed the error into ``[]`` — the
+    fast first paint silently dropped every CLI/agent row (and the
+    cron/webhook/kanban chips) on such a store, with no exception for the route
+    to fall back from.
+    """
+    _install_fixture(monkeypatch, tmp_path)
+    _drop_sessions_indexes(tmp_path / "state.db")
+
+    full = _build_full()
+    fast = _build_fast()
+    _assert_payload_parity(full, fast)
+    assert fast["cli_session_count"] == full["cli_session_count"] > 0
+
+
+def test_fast_window_cli_read_failure_is_not_swallowed_into_zero_rows(monkeypatch, tmp_path):
+    """A raising fast CLI read must not become an empty CLI list.
+
+    ``get_cli_sessions(fast_window=True)`` is the fast first paint's CLI/agent
+    read; swallowing a failure into ``[]`` silently drops every CLI/agent row
+    (chips included) from the first paint while the full builder returns them.
+    The exception propagates so the route's documented fast-build-failure
+    fallback (``_get_cached_session_list_payload`` → the synchronous full build)
+    serves the request instead — the fast path degrades, it never omits.
+    """
+    _install_fixture(monkeypatch, tmp_path)
+
+    def _boom(*_args, **_kwargs):
+        raise sqlite3.ProgrammingError("Incorrect number of bindings supplied")
+
+    monkeypatch.setattr(models, "read_fast_sidebar_agent_rows", _boom)
+    with pytest.raises(sqlite3.ProgrammingError):
+        models.get_cli_sessions(include_claude_code=False, fast_window=True)
+
+
 def test_fast_payload_is_bounded_and_fills_user_counts_lazily(monkeypatch, tmp_path):
     """The user-turn fallback query must only cover rows dropped by the
     visibility filter, never the whole candidate window."""

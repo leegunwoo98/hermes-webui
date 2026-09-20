@@ -8347,7 +8347,11 @@ def get_cli_sessions(
     dicts in a format the WebUI sidebar can render alongside local sessions.
 
     Returns empty list if the SQLite DB is missing or any error occurs -- the
-    bridge is purely additive and never crashes the WebUI.
+    bridge is purely additive and never crashes the WebUI. ``fast_window=True``
+    is the one exception: its read failure propagates to the caller (the
+    route's fast builder), whose failure path serves the synchronous full
+    build, because an empty fast CLI list would silently omit rows the full
+    builder returns.
 
     ``fast_window=True`` (Slice C fast first paint) projects the bounded
     ``read_fast_sidebar_agent_rows`` window through the same loader and NEVER
@@ -8442,14 +8446,17 @@ def get_cli_sessions(
         # stored fast list is a bounded window the full builder must not serve,
         # and a stored full list would defeat the fast path. The background full
         # rebuild is the only writer of that cache.
-        try:
-            return _load_sessions()
-        except Exception as _cli_err:
-            logger.warning(
-                "get_cli_sessions(fast_window) failed — check state.db schema or path (%s): %s",
-                db_path, _cli_err,
-            )
-            return []
+        #
+        # A read failure PROPAGATES here, unlike the cached branches below
+        # (which degrade to the stale list / ``[]``): this window's only caller
+        # is the route's fast builder, whose documented failure path
+        # (``_get_cached_session_list_payload``: fast-build failure → the
+        # unchanged synchronous full build) owns the degradation. Swallowing
+        # into ``[]`` silently dropped every CLI/agent row — and the
+        # cron/webhook/kanban chips — from the fast first paint while the full
+        # builder returned them, with no exception for the route to fall back
+        # from: the omission class the fast path must not have.
+        return _load_sessions()
 
     if ttl > 0:
         stale_sessions = None
