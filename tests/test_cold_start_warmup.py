@@ -103,8 +103,24 @@ def _install_route_stubs(monkeypatch):
     monkeypatch.setattr(routes, "get_cli_sessions", lambda source_filter=None, all_profiles=False: [])
     monkeypatch.setattr(routes, "agent_session_rows_existing", lambda ids, profile=None: set())
     monkeypatch.setattr(routes, "load_settings", lambda: dict(_DEFAULT_SETTINGS))
-    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    # Mirrors server.py: the browser's hermes_profile cookie lands in the
+    # thread-local, which the route's profile resolution reads first.
+    monkeypatch.setattr(
+        profiles, "get_active_profile_name",
+        lambda: getattr(profiles._tls, "profile", None) or "default",
+    )
+    # Pin the warm-up's enumeration seam: tests must never depend on the
+    # profiles that happen to exist on the box running them.
+    monkeypatch.setattr(routes, "_warmup_profile_names", lambda: (["default"], 1))
     return calls
+
+
+def _pin_warmup_profiles(monkeypatch, names, known=None):
+    """Pin the profiles the warm-up enumerates (the registry seam)."""
+    monkeypatch.setattr(
+        routes, "_warmup_profile_names",
+        lambda: (list(names), known if known is not None else len(names)),
+    )
 
 
 def _route_key_for_query(query: str, settings: dict | None = None) -> tuple:
@@ -235,6 +251,93 @@ def test_warmup_does_not_claim_or_fill_a_wrong_shape_key(monkeypatch):
     assert routes._session_list_cache_get(wrong_key, allow_stale=True) == (None, False), (
         "a wrong-shape key must not be claimed or filled by the warm-up"
     )
+
+
+# ── profile coverage (P1): every profile a cookie can name gets a warm slot ──
+
+def test_warmup_profile_names_default_first_deduped_and_capped(monkeypatch):
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    rows = [{"name": "default"}, {"name": "default"}] + [
+        {"name": f"p{i}"} for i in range(1, 8)
+    ]
+    monkeypatch.setattr(profiles, "list_profiles_api", lambda: rows)
+
+    names, known = routes._warmup_profile_names()
+    assert names[0] == "default", "the process default must be warmed first"
+    assert names == ["default", "p1", "p2", "p3"], (
+        "enumeration must be bounded to _WARMUP_MAX_PROFILES and deduped"
+    )
+    assert len(names) <= routes._WARMUP_MAX_PROFILES
+    assert known == 8, "the pre-cap count is returned so callers can log the cap"
+
+
+def test_warmup_profile_names_fall_back_to_the_process_default(monkeypatch):
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "rooty")
+    monkeypatch.setattr(
+        profiles, "list_profiles_api",
+        lambda: (_ for _ in ()).throw(RuntimeError("registry unavailable")),
+    )
+
+    names, known = routes._warmup_profile_names()
+    assert names == ["rooty"], "a failed enumeration must still warm the process default"
+    assert known == 1
+
+
+def test_warmup_fills_the_slot_a_non_default_cookie_profile_reads(monkeypatch):
+    """The warm-up runs with no request context, so it must warm EVERY profile a
+    ``hermes_profile`` cookie can name — not only the process default."""
+    _install_route_stubs(monkeypatch)
+    _pin_warmup_profiles(monkeypatch, ["default", "alpha"])
+
+    rows = [
+        {**_rows()[0], "session_id": "webui-default", "profile": "default"},
+        {**_rows()[0], "session_id": "webui-alpha", "profile": "alpha"},
+    ]
+    calls = {"all_sessions": 0}
+
+    def _all_sessions(diag=None, **_kwargs):
+        calls["all_sessions"] += 1
+        return [dict(row) for row in rows]
+
+    monkeypatch.setattr(routes, "all_sessions", _all_sessions)
+
+    stats = routes.warm_default_session_list_cache(wait_timeout=10.0)
+    assert {entry["profile"] for entry in stats["profiles"]} == {"default", "alpha"}
+    assert all(entry["completed"] for entry in stats["profiles"])
+    assert stats["capped"] is False
+
+    # The key the route builds for a request carrying the alpha cookie is the
+    # key the warm-up filled, so that request reads the warmed slot.
+    profiles.set_request_profile("alpha")
+    try:
+        alpha_key = _route_key_for_query("sidebar_source=webui&exclude_hidden=1")
+        assert any(entry["key"] == alpha_key for entry in stats["profiles"])
+        payload, fresh = routes._session_list_cache_get(alpha_key, allow_stale=True)
+        assert payload is not None and fresh, "the alpha-profile slot was not warmed"
+        assert [row["session_id"] for row in payload["sessions"]] == ["webui-alpha"]
+
+        warmed_calls = calls["all_sessions"]
+        handler = _handle_sessions(
+            "http://example.com/api/sessions?sidebar_source=webui&exclude_hidden=1"
+        )
+    finally:
+        profiles.clear_request_profile()
+
+    assert handler.status == 200
+    assert [row["session_id"] for row in handler.json_body()["sessions"]] == ["webui-alpha"]
+    assert calls["all_sessions"] == warmed_calls, (
+        "the alpha-profile request rebuilt instead of reading the warmed slot"
+    )
+
+
+def test_warmup_reports_when_the_profile_cap_was_hit(monkeypatch):
+    _install_route_stubs(monkeypatch)
+    _pin_warmup_profiles(monkeypatch, ["default", "p1"], known=9)
+
+    stats = routes.warm_default_session_list_cache(wait_timeout=10.0)
+    assert stats["capped"] is True
+    assert stats["profiles_known"] == 9
+    assert stats["profiles_considered"] == 2
 
 
 def test_warmup_respects_an_existing_claim_without_a_home_made_event(monkeypatch):

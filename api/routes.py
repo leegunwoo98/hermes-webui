@@ -8,6 +8,7 @@ import copy
 import hashlib
 import inspect
 import errno
+import functools
 import io
 import gzip
 import json
@@ -2047,7 +2048,8 @@ def _session_list_request_shape(parsed) -> dict:
 def _session_list_cache_request_plan(settings: dict, *, all_profiles: bool,
                                      include_archived: bool, exclude_hidden: bool,
                                      archived_limit, archived_offset: int,
-                                     sidebar_source) -> tuple[tuple, dict]:
+                                     sidebar_source,
+                                     active_profile: str | None = None) -> tuple[tuple, dict]:
     """Assemble the cache key AND the builder kwargs for ONE request shape.
 
     The settings-derived flags, the active profile and the request shape together
@@ -2055,10 +2057,16 @@ def _session_list_cache_request_plan(settings: dict, *, all_profiles: bool,
     startup warm-up cannot disagree about which cache slot a shape maps to (the
     cache is capped at ``_SESSIONS_CACHE_MAX_ENTRIES`` with LRU eviction, so a
     drifted key would warm a slot no request reads).
+
+    ``active_profile`` defaults to the request's thread-local profile (the
+    ``hermes_profile`` cookie path applied by server.py). The startup warm-up
+    runs with no request context, so it passes each profile it enumerates
+    explicitly — see ``_warmup_profile_names``.
     """
     from api import profiles as profiles_api
 
-    active_profile = profiles_api.get_active_profile_name()
+    if active_profile is None:
+        active_profile = profiles_api.get_active_profile_name()
     show_cli_sessions = bool(settings.get("show_cli_sessions"))
     show_claude_code_sessions = bool(settings.get("show_claude_code_sessions"))
     show_previous_messaging_sessions = bool(settings.get("show_previous_messaging_sessions"))
@@ -2821,7 +2829,8 @@ def _hidden_archived_sidebar_reference_sessions(
     return references
 
 
-def _start_session_list_cache_background_rebuild(key: tuple, event, builder) -> None:
+def _start_session_list_cache_background_rebuild(key: tuple, event, builder, *,
+                                                 profile: str | None = None) -> None:
     """Run ``builder`` off-thread for ``key`` and release the claim in every path.
 
     ``event`` MUST be the event ``_session_list_cache_claim_rebuild(key)``
@@ -2829,8 +2838,21 @@ def _start_session_list_cache_background_rebuild(key: tuple, event, builder) -> 
     home-made ``threading.Event`` would leave the registered claim in place and
     its waiters blocked. The thread is a daemon, and the claim is released in a
     ``finally`` even when the builder raises.
+
+    ``profile`` (optional): run the WHOLE rebuild — the builder and the cache
+    write, whose source stamp resolves the active Hermes home — under this
+    profile's thread-local request context. The rebuild thread carries no request
+    cookie, so without this a rebuild keyed for a non-default profile would read
+    and stamp the process default profile's state.db; the slot would then be
+    invalidated on the first real request that reads it.
     """
     def _rebuild():
+        if profile:
+            try:
+                from api.profiles import set_request_profile
+                set_request_profile(profile)
+            except Exception:
+                pass
         try:
             rebuild_attempts = 0
             while True:
@@ -2856,6 +2878,12 @@ def _start_session_list_cache_background_rebuild(key: tuple, event, builder) -> 
                     return
         finally:
             _session_list_cache_done(key, event)
+            if profile:
+                try:
+                    from api.profiles import clear_request_profile
+                    clear_request_profile()
+                except Exception:
+                    pass
 
     try:
         thread = threading.Thread(
@@ -2993,12 +3021,65 @@ def _get_cached_session_list_payload(
     return payload
 
 
-def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
-    """Claim and drive ONE background rebuild for the sidebar's default shape.
+# Upper bound on the number of profile slots the startup warm-up fills. Each
+# slot is one bounded sidebar rebuild on the warm daemon thread, so a large
+# profile set must not turn startup into N heavy builds; when the registry
+# reports more, the process default plus the next names are warmed and the cap
+# is reported in the [warmup] log line.
+_WARMUP_MAX_PROFILES = 4
 
-    Startup-only best-effort warm for the exact key the frontend's first
+
+def _warmup_profile_names() -> tuple[list[str], int]:
+    """Return (profile names to warm, profiles known before the cap).
+
+    The warm-up runs on a daemon thread with no request context, so
+    ``get_active_profile_name()`` resolves the process default there — while a
+    real ``/api/sessions`` request resolves the browser's ``hermes_profile``
+    cookie via ``server.py`` → ``set_request_profile()``. Enumerating the same
+    registry surface the profile switcher uses (``list_profiles_api()``) means
+    any cookie value a user can actually hold hits a warmed slot. The process
+    default is always first and always included (even if the registry call
+    fails); the result is bounded to ``_WARMUP_MAX_PROFILES``.
+    """
+    from api import profiles as profiles_api
+
+    names: list[str] = []
+
+    def _add(name) -> None:
+        normalized = str(name or "").strip()
+        if normalized and normalized not in names:
+            names.append(normalized)
+
+    try:
+        _add(profiles_api.get_active_profile_name())
+    except Exception:
+        _add("default")
+    try:
+        for row in profiles_api.list_profiles_api() or []:
+            if isinstance(row, dict):
+                _add(row.get("name"))
+            else:
+                _add(getattr(row, "name", None))
+    except Exception:
+        pass  # best-effort: the process default is always warmed
+    return names[:_WARMUP_MAX_PROFILES], len(names)
+
+
+def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
+    """Claim and drive background rebuilds for the sidebar's default shape.
+
+    Startup-only best-effort warm for the exact keys the frontend's first
     ``/api/sessions?sidebar_source=webui&exclude_hidden=1`` request reads. The
-    rebuild goes through the registered claim event
+    warm-up runs on a daemon thread with no request context, so
+    ``get_active_profile_name()`` resolves the process default there — while a
+    real request resolves the browser's ``hermes_profile`` cookie per-thread
+    (``server.py`` → ``set_request_profile``). Warming only the process default
+    would fill a slot a non-default browser never reads, so every profile the
+    registry reports is warmed (bounded to ``_WARMUP_MAX_PROFILES``, process
+    default first; ``profiles_known`` carries the pre-cap count so the caller
+    can log the cap).
+
+    Each rebuild goes through the registered claim event
     (``_session_list_cache_claim_rebuild`` → ``_start_session_list_cache_background_rebuild``)
     so any concurrent waiter is released by the normal ``_session_list_cache_done``
     path; an already-owned key is left to its owner.
@@ -3008,22 +3089,61 @@ def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
     sidecars); it does not write state.db.
     """
     started = time.monotonic()
-    stats = {"owner": False, "completed": False, "elapsed_ms": 0, "key": None, "error": None}
+    stats: dict = {
+        "owner": False,
+        "completed": False,
+        "key": None,
+        "profiles": [],
+        "profiles_considered": 0,
+        "profiles_known": 0,
+        "capped": False,
+        "elapsed_ms": 0,
+        "error": None,
+    }
     try:
         settings = load_settings()
-        key, builder_kwargs = _session_list_cache_request_plan(
-            settings, **_DEFAULT_SIDEBAR_REQUEST_SHAPE
-        )
-        stats["key"] = key
-        event, is_owner = _session_list_cache_claim_rebuild(key)
-        stats["owner"] = bool(is_owner)
-        if is_owner:
-            _start_session_list_cache_background_rebuild(
-                key,
-                event,
-                lambda: _build_session_list_cache_payload(**builder_kwargs),
+        names, known = _warmup_profile_names()
+        stats["profiles_known"] = known
+        stats["capped"] = known > len(names)
+        deadline = started + wait_timeout
+        entries: list[dict] = []
+        claims: list[tuple[dict, threading.Event]] = []
+        seen_keys: set = set()
+        for name in names:
+            key, builder_kwargs = _session_list_cache_request_plan(
+                settings, active_profile=name, **_DEFAULT_SIDEBAR_REQUEST_SHAPE
             )
-        stats["completed"] = bool(event.wait(wait_timeout))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            event, is_owner = _session_list_cache_claim_rebuild(key)
+            entry = {
+                "profile": name,
+                "key": key,
+                "owner": bool(is_owner),
+                "completed": False,
+            }
+            entries.append(entry)
+            if is_owner:
+                _start_session_list_cache_background_rebuild(
+                    key,
+                    event,
+                    functools.partial(_build_session_list_cache_payload, **builder_kwargs),
+                    profile=name,
+                )
+            claims.append((entry, event))
+        for entry, event in claims:
+            if entry["owner"]:
+                entry["completed"] = bool(
+                    event.wait(max(0.0, deadline - time.monotonic()))
+                )
+        stats["profiles"] = entries
+        stats["profiles_considered"] = len(entries)
+        owned = [entry for entry in entries if entry["owner"]]
+        stats["owner"] = bool(owned)
+        stats["completed"] = bool(owned) and all(entry["completed"] for entry in owned)
+        if entries:
+            stats["key"] = entries[0]["key"]
     except Exception as exc:
         stats["error"] = f"{type(exc).__name__}: {exc}"
     stats["elapsed_ms"] = int((time.monotonic() - started) * 1000)
