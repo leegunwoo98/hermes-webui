@@ -485,11 +485,12 @@ def get_sticky_active_profile_name() -> str:
 
     Unlike ``get_active_profile_name()`` this ignores the request thread-local and
     the process-level switch: it is the on-disk choice ``init_profile_state()``
-    reads at startup and process-wide switches write, i.e. the profile the user
-    last switched to. Read-only and never creates the file, so a background
-    caller with no request context (the startup warm-up) can order its work around
-    the profile a returning browser most likely names in its ``hermes_profile``
-    cookie.
+    reads at startup and process-wide switches write. Read-only and never creates
+    the file, so a background caller with no request context (the startup warm-up)
+    can order its work around it — as a tie-break: the WebUI's own profile switch
+    is per-client (``process_wide=False``) and does not write the file, and on a
+    plain start this equals the process default, so it degenerates to
+    default-first.
     """
     return _read_active_profile_file()
 

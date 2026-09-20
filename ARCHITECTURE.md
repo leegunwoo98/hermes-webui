@@ -488,22 +488,29 @@ Lifecycle and guarantees:
   request path already writes (session index / sidecars); it does not write `state.db`.
 - **Warm order** (`_warmup_profile_names`): the **sticky/active profile first** — the
   `active_profile` file `init_profile_state()` reads at startup and process-wide switches
-  write, i.e. the best available guess at the profile the returning browser's cookie names
-  — then the **process default**, then the remaining registry profiles
-  **most-recently-used first**. Recency is read from the registry rows' own `path`
+  write — then the **process default**, then the remaining registry profiles
+  **most-recently-used first**. The sticky clause is a tie-break, not a claim about the
+  returning browser: the WebUI's own profile switch is per-client (`process_wide=False`)
+  and does not write that file, and `init_profile_state()` reads the same file at startup,
+  so on a WebUI-only box the sticky name equals the process default and the order
+  degenerates to default-first (it diverges only when the file changed after startup —
+  CLI / another process / isolated-profile mode). What covers the likely profiles is the
+  ordering guarantee — the first slot is warmed first and cannot be starved — plus the MRU
+  order for the rest. Recency is read from the registry rows' own `path`
   (`state.db` / `state.db-wal` / `sessions` mtime; ties keep the registry's order — no new
   store, and deliberately not `state.db-shm` or the profile home, which readers/WebUI state
   resolution touch). The sticky name is honored only when the registry reports it, so a
   stale `active_profile` cannot burn one of the capped slots; the process default is always
   included, even when the registry call fails.
-- **One profile at a time, each with its own slice of the budget.**
+- **One profile's rebuild started at a time, each with its own slice of the budget.**
   `warm_default_session_list_cache(wait_timeout=…)` claims, starts and waits for one
-  profile's rebuild before it touches the next, so the builds no longer contend with each
-  other (and with the first real request) and a slow profile cannot consume the window the
-  profiles behind it need. Each profile's wait is bounded to `remaining / profiles-left`
-  of the overall deadline: with the shipped cap of 4 and
-  `_WARMUP_SESSION_WAIT_SECONDS = 30.0` that is at least 7.5 s per profile, and budget a
-  fast profile leaves unused is redistributed to the ones behind it. The wait is the only
+  profile's rebuild before it touches the next, so the starts are serialized: a build that
+  outlives its slice keeps running while the next starts (measured overlap 2 on a slow-first
+  profile; bounded by the timed-out builds + 1, versus the old all-at-once launch), and a
+  slow profile cannot consume the window the profiles behind it need. Each profile's wait
+  is bounded to `remaining / profiles-left` of the overall deadline: with the shipped cap of
+  4 and `_WARMUP_SESSION_WAIT_SECONDS = 30.0` that is at least 7.5 s per profile, and budget
+  a fast profile leaves unused is redistributed to the ones behind it. The wait is the only
   thing bounded — a build that outlives its slice keeps its claim and still fills the slot
   when it finishes; the reported outcome for it is `timeout`, not a lie about the cache.
   Each per-profile entry carries the `slice_seconds` it was given, and `profiles` is in

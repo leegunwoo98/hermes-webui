@@ -3070,18 +3070,23 @@ def _warmup_profile_names() -> tuple[list[str], int]:
     """Return (profile names to warm IN WARM ORDER, profiles known pre-cap).
 
     Order: the sticky/active profile first — the ``active_profile`` file
-    ``init_profile_state()`` reads at startup and process-wide switches write, i.e.
-    the profile the user last switched to and the best available guess at the one a
-    returning browser's ``hermes_profile`` cookie names — then the process default,
-    then the remaining registry profiles by most-recently-used
-    (``_warmup_profile_recency_ns``; ties keep the registry's own order).
+    ``init_profile_state()`` reads at startup and process-wide switches write — then
+    the process default, then the remaining registry profiles by most-recently-used
+    (``_warmup_profile_recency_ns``; ties keep the registry's own order). The sticky
+    clause is a tie-break, not a claim about the returning browser: the WebUI's
+    profile switch is per-client (``process_wide=False``) and does not write that
+    file, and ``init_profile_state()`` reads the same file at startup, so on a
+    WebUI-only box the sticky name equals the process default and the order
+    degenerates to default-first (it diverges only when the file changed after
+    startup — CLI / another process / isolated-profile mode).
 
     The warm-up runs on a daemon thread with no request context, so
     ``get_active_profile_name()`` resolves the process default there — while a
     real ``/api/sessions`` request resolves the browser's ``hermes_profile``
     cookie via ``server.py`` → ``set_request_profile()``. Enumerating the same
-    registry surface the profile switcher uses (``list_profiles_api()``) means any
-    cookie value a user can actually hold hits a warmed slot.
+    registry surface the profile switcher uses (``list_profiles_api()``) means
+    cookie values map onto the warm order rather than only onto ``default``
+    (bounded by ``_WARMUP_MAX_PROFILES``).
 
     The process default is always included (even if the registry call fails); the
     sticky name is honored only when the registry reports it, so a stale
@@ -3191,7 +3196,8 @@ def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
     else ``ok`` if at least one landed, else ``skipped``; ``profiles_warmed``
     counts the ``ok`` slots.
 
-    Warm order and budget: profiles are warmed ONE AT A TIME, in the order
+    Warm order and budget: profiles' rebuilds are STARTED one at a time (a build
+    that outlives its slice keeps running while the next starts), in the order
     ``_warmup_profile_names`` returns (sticky/active first, then the process
     default, then most-recently-used), and each profile's wait is bounded to its
     OWN slice of what is left of the overall deadline — ``wait_timeout`` divided by
@@ -3254,8 +3260,9 @@ def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
             if not is_owner:
                 entry["status"] = "skipped"
                 continue
-            # Serialized: this profile's rebuild is started only now, so it runs
-            # alone instead of contending with the profiles behind it.
+            # Serialized: this profile's rebuild is started only now — after the
+            # previous profile's wait — so starts never pile up (a build that
+            # outlived its slice may still be running alongside this one).
             _start_session_list_cache_background_rebuild(
                 key,
                 event,
