@@ -65,7 +65,7 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       profiles.py          Profile state management, hermes_cli wrapper
       onboarding.py        First-run onboarding status, real provider config writes, OAuth linking, readiness detection
       routes.py            All GET + POST route handlers (if/elif dispatch, no decorators)
-      startup.py           Startup helpers: auto_install_agent_deps()
+      startup.py           Startup helpers: credential permissions, agent-dep install, post-bind cold-start warm-up (see 4.10)
       state_sync.py        /insights sync — message_count to the agent's state.db
       streaming.py         SSE engine, run_agent, cancel, compression, HERMES_HOME save/restore
       updates.py           Self-update check and release notes
@@ -451,6 +451,49 @@ split moves another name, route it through `agent_attr` and add pre-split and
 pointer-removed cases to `tests/test_agent_compat.py`. The resolver is
 compatibility-only: delete it, and import directly from the new homes, once the WebUI
 stops supporting Agents that predate the split.
+
+### 4.10 Cold-Start Warm-Up (post-bind, best-effort)
+
+`server.py` starts one warm-up right AFTER the HTTP socket has bound and BEFORE
+`serve_forever()` — the single line `start_cold_start_warmup_after_bind()` (wiring lives
+in `api/startup.py`, keeping the routing shell thin). It exists because the first sidebar
+load otherwise pays a multi-second cold build on the request path.
+
+Lifecycle and guarantees:
+
+- **One bounded attempt per process.** `api.startup.start_cold_start_warmup()` holds
+  `_warmup_started` under `_warmup_lock`, so later calls (or a second bind) return `None`.
+  The work runs on ONE daemon thread (`webui-cold-start-warmup`): it can never delay
+  readiness and never keeps the process alive at shutdown. A failure to start the thread
+  is logged (`[!!] WARNING: cold-start warm-up failed to start: …`), never raised.
+- **Failures are logged, not fatal.** Every step is wrapped; a failing component is
+  reported in the single `[warmup] cold-start warm-up finished in N ms (…)` line and the
+  process serves normally.
+- **Kill switch.** `HERMES_WEBUI_NO_WARMUP=1` (`true`/`yes` accepted) disables the whole
+  warm-up for that process — use it when profiling, or when debugging a cold-path bug
+  that the warm-up would mask. When disabled no `[warmup]` line is printed at all.
+- **What it warms.** (a) The models catalog provenance **disk** cache
+  (`warm_models_catalog_provenance_if_cold()`): disk-only, takes the models cache lock
+  non-blocking, and deliberately never enters the live provider-catalog rebuild (which can
+  hold `_available_models_cache_lock` for up to 60 s and would make the first `/api/models`
+  slower, not faster). (b) The sidebar session-list cache slot for the frontend's default
+  request shape (`sidebar_source=webui` + `exclude_hidden=1`), driven through the same
+  claim/rebuild machinery the route uses (`api/routes.py: warm_default_session_list_cache`,
+  `_start_session_list_cache_background_rebuild`). The warm-up runs on a thread with no
+  request context, so it warms **every profile the registry reports** (process default
+  first, deduped, bounded to `_WARMUP_MAX_PROFILES = 4`; the cap is reported in the
+  `[warmup]` line as `capped of N known`) — each rebuild runs under that profile's
+  thread-local context so both the payload and the profile-resolved cache source stamp
+  match what the browser's `hermes_profile` cookie will resolve on its first request. The
+  builder writes what the request path already writes (session index / sidecars); it does
+  not write `state.db`.
+- **Reported outcome ≠ event completion.** The claim event is signaled even when the
+  builder raises, so the `[warmup]` line reports what the cache actually holds: per
+  profile `ok` (fresh entry landed) / `failed` (event signaled, no fresh entry) /
+  `timeout` / `skipped` (another rebuild owns the key), plus `profiles=warmed/considered`.
+  A cold-start request that arrives while a rebuild is still running still pays that
+  build; the warm-up removes the build from the request path for requests that arrive
+  after it completes.
 
 ---
 
