@@ -907,8 +907,19 @@ def _fill_fast_visibility_user_counts(cur, message_cols: set[str], rows: list[di
     because a collapsed compression row carries the tip's counts — so the second
     filter pass reproduces the full projection's decision for default-titled CLI
     rows and ACP rows, which are visible only when their user turns are known.
+
+    Legacy schemas without a usable ``messages.session_id`` (no ``messages``
+    table, or one without the column) cannot answer that query. The full reader
+    degrades to the denormalized ``s.message_count`` for both counts there
+    (``use_messages_join`` is keyed on ``session_id`` alone), so mirror that
+    instead of querying a missing table/column — the ``OperationalError`` would
+    escape the read and cost the caller its bounded fast window.
     """
     if not rows:
+        return
+    if 'session_id' not in message_cols:
+        for row in rows:
+            row['actual_user_message_count'] = row.get('message_count')
         return
     ids: list[str] = []
     for row in rows:

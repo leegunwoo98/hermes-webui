@@ -658,6 +658,59 @@ def test_fast_reader_degrades_without_a_messages_table(monkeypatch, tmp_path):
     assert rows[0]["message_count"] == 3
 
 
+@pytest.mark.parametrize("messages_ddl", [
+    None,
+    "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, content TEXT)",
+])
+def test_fast_reader_degrades_without_messages_session_id_for_hidden_rows(tmp_path, messages_ddl):
+    """Legacy schemas without a usable ``messages.session_id`` must not raise
+    from the visibility fallback.
+
+    ``_fill_fast_visibility_user_counts`` is the fast window's only post-filter
+    query and it always reads ``messages.session_id``. On a schema without that
+    column (or without the table), an initially hidden CLI/ACP row turns the
+    whole read into an ``OperationalError`` — the bounded fast window is lost —
+    instead of the full reader's degradation (denormalized ``s.message_count``
+    for the user-turn count, ``use_messages_join`` keyed on ``session_id``
+    alone). Both readers must agree here.
+    """
+    import api.agent_sessions as agent_sessions
+
+    db_path = tmp_path / "legacy-hidden.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, title TEXT, model TEXT, "
+        "started_at REAL, message_count INTEGER, last_activity_at REAL, parent_session_id TEXT, "
+        "end_reason TEXT, ended_at REAL)"
+    )
+    if messages_ddl:
+        conn.execute(messages_ddl)
+    # Both rows are initially hidden (NULL user-turn count): a default-titled
+    # CLI row needs >= CLI_MIN_UNTITLED_USER_MESSAGE_COUNT user turns, an ACP
+    # row needs at least one.
+    conn.execute(
+        "INSERT INTO sessions (id, source, title, started_at, message_count, last_activity_at) "
+        "VALUES ('legacy-untitled', 'cli', NULL, ?, 2, ?)",
+        (T + 10, T + 12),
+    )
+    conn.execute(
+        "INSERT INTO sessions (id, source, title, started_at, message_count, last_activity_at) "
+        "VALUES ('legacy-acp', 'acp', NULL, ?, 2, ?)",
+        (T + 20, T + 22),
+    )
+    conn.commit()
+    conn.close()
+
+    fast = agent_sessions.read_fast_sidebar_agent_rows(
+        db_path, limit=20, exclude_sources=("cron", "webhook", "kanban"),
+    )
+    full = agent_sessions.read_importable_agent_session_rows(
+        db_path, limit=20, exclude_sources=("cron", "webhook", "kanban"),
+    )
+    assert [row["id"] for row in fast] == [row["id"] for row in full]
+    assert [row["id"] for row in fast] == ["legacy-acp", "legacy-untitled"]
+
+
 def _make_edge_schema_without_message_timestamps(tmp_path):
     """state.db with ``messages(session_id, role, content)`` — no ``timestamp``.
 
