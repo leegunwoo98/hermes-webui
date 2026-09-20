@@ -948,6 +948,37 @@ def test_fast_window_cli_read_failure_is_not_swallowed_into_zero_rows(monkeypatc
         models.get_cli_sessions(include_claude_code=False, fast_window=True)
 
 
+def test_failing_fast_cli_read_serves_the_full_payload_through_the_route(monkeypatch, tmp_path):
+    """The documented fallback, end to end: a failing fast CLI read makes the
+    route serve the unchanged full payload, not a fast one missing every CLI row.
+
+    ``_build_session_list_fast_payload`` does not swallow a fast CLI read
+    failure, so ``_get_cached_session_list_payload`` catches it on the
+    ``fast_builder()`` call and falls through to the synchronous full build —
+    the documented behavior the fast-window propagation exists to reach.
+    """
+    _install_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
+    full = _build_full()
+    real_get_cli_sessions = routes.get_cli_sessions
+
+    def _failing_get_cli_sessions(*args, **kwargs):
+        if kwargs.get("fast_window"):
+            raise sqlite3.ProgrammingError("Incorrect number of bindings supplied")
+        return real_get_cli_sessions(*args, **kwargs)
+
+    monkeypatch.setattr(routes, "get_cli_sessions", _failing_get_cli_sessions)
+    served = routes._get_cached_session_list_payload(
+        key=_cache_key(),
+        builder=_build_full,
+        fast_builder=lambda: _build_fast(),
+    )
+    assert [r["session_id"] for r in served["sessions"]] == [
+        r["session_id"] for r in full["sessions"]
+    ]
+    assert served["cli_session_count"] == full["cli_session_count"] > 0
+
+
 def test_fast_payload_is_bounded_and_fills_user_counts_lazily(monkeypatch, tmp_path):
     """The user-turn fallback query must only cover rows dropped by the
     visibility filter, never the whole candidate window."""

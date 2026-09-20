@@ -124,8 +124,11 @@ behavior and changes no runtime behavior.
   away".
 - The session-row seeds require the agent's standard indexes
   (`idx_sessions_effective_activity` / `idx_sessions_started`). Without them the
-  plain exact-key window runs — the pre-union behavior — instead of sorting the
-  whole sessions table per pre-window.
+  plain exact-key window runs — the pre-union behavior, bound with its own
+  parameters (`where_sql` + `LIMIT ?`) — instead of sorting the whole sessions
+  table per pre-window. A fast CLI read that fails then propagates to the
+  route's fast-build failure path (see Fallbacks); it is never degraded to an
+  empty CLI list.
 - The full reader keeps the exact-key window over all qualifying sessions: it
   runs in the background rebuild, not on the first-paint path, and it is the
   parity reference the fast window is checked against.
@@ -133,15 +136,24 @@ behavior and changes no runtime behavior.
 ## Fallbacks
 
 - Fast-build failure → the unchanged synchronous full build for that request
-  (the fast payload is built before the rebuild event is claimed).
+  (the fast payload is built before the rebuild event is claimed). A failing
+  fast CLI read is one such failure: `get_cli_sessions(fast_window=True)`
+  propagates instead of degrading to an empty list, because an empty CLI list
+  would silently omit every CLI/agent row the full builder returns.
 - Archive/paged/`all_profiles`/source-filter shapes, and `visible_only=False`,
   keep the full builder synchronously.
 - Legacy schemas: `read_fast_sidebar_agent_rows` mirrors the full reader's
   degradation — no `messages` table → denormalized counts + `started_at`; no
   `messages.session_id` → denormalized counts; no `messages.timestamp` →
   `started_at` window; `limit=None` (the `all_profiles` projection) → delegates
-  to the full reader. A read-only open failure returns an empty list; the full
-  rebuild recovers the sidebar.
+  to the full reader.
+- A read-only open failure returns an empty list (the fast reader must never
+  create or write the store; the full reader instead falls back to a writable
+  open, so the two can diverge on a store only a writable open can reach — e.g.
+  WAL shared-memory creation). That request's fast payload carries no CLI/agent
+  rows until the background full rebuild lands: the same transient divergence
+  class as the bound above, and the one remaining silent-degradation path on
+  this reader, kept because the fast path must not create the store.
 - The fast reader never writes: read-only open, no defensive index self-heal, no
   tombstone/prune bookkeeping — the full rebuild owns those.
 

@@ -1066,9 +1066,13 @@ def read_fast_sidebar_agent_rows(
 ) -> list[dict]:
     """Bounded first-paint variant of :func:`read_importable_agent_session_rows`.
 
-    Same candidate window (exact ``COALESCE(MAX(mx.timestamp), s.started_at)
-    DESC, s.started_at DESC`` with the 8x oversample — the same key and the same
-    completeness guarantee as the full reader), the same
+    The same exact ordering key as the full reader (``COALESCE(MAX(mx.timestamp),
+    s.started_at) DESC, s.started_at DESC`` with the 8x oversample) — the key,
+    not the row set: the fast reader evaluates it over a bounded union of
+    index-ordered pre-windows instead of over every qualifying session, so its
+    window is the display order's prefix over the seeded set and not over all
+    sessions (``_fast_candidate_union_cte`` states the precise bound and the
+    counterexample it pins). The same
     ``_project_agent_session_rows`` compression/continuation collapse, the same
     ``_with_normalized_source`` flags, the same ``is_cli_session_row_visible``
     filter and the same subagent-parent re-add — only the user-turn aggregation
@@ -1201,16 +1205,18 @@ def read_fast_sidebar_agent_rows(
             params.extend(wanted_ids)
 
         if use_messages_join and messages_has_timestamp:
-            # Same exact candidate key as the full reader (and the same
-            # guarantee): the window must be a prefix of the display order, not
-            # an oversample of the lagging ``s.last_activity_at``.
+            # The same exact ordering key as the full reader — never an
+            # oversample of the lagging ``s.last_activity_at``. It is the key
+            # that matches, not the row set: the window is the display order's
+            # prefix over the seeded candidate set, and the seeds are bounded
+            # (``_fast_candidate_union_cte`` holds the precise bound, the
+            # counterexample it pins, and the measured cost curve).
             #
             # The key is evaluated per *qualifying* row before LIMIT, so the
             # fast reader does not order the whole store by it: the candidate
             # set is seeded with a bounded union of index-ordered pre-windows
-            # and the exact key is applied only over that union
-            # (``_fast_candidate_union_cte`` — the measured cost curve and the
-            # guarantee live there). The final exact sort is unchanged.
+            # and the exact key is applied only over that union. The final exact
+            # sort is unchanged.
             candidate_order_clause = (
                 "ORDER BY COALESCE((SELECT MAX(mx.timestamp) FROM messages mx "
                 "WHERE mx.session_id = s.id), s.started_at) DESC, s.started_at DESC"

@@ -101,11 +101,12 @@ contributor guidance; it does not change runtime behavior or CI gates.
   current runtime contract for the `/api/sessions` sidebar payload lifecycle:
   the cold-miss fast first paint (bounded indexed reads, default-shape gate,
   never stored), the full builder + background rebuild as the only cache writer,
-  the fast/full parity contract, the candidate-window guarantee (exact ordering
-  key over a bounded union of index-ordered pre-windows, with the measured cost
-  curve and its residual bound), the fallback behaviors, and the settings/cache
-  keying. Start here before changing the sidebar first-paint path, the candidate
-  window, or the session-list cache ownership.
+  the fast/full parity contract, the candidate window (its exact ordering key
+  over a bounded union of index-ordered pre-windows, with the measured cost
+  curve, the precise seed-set bound and its pinned counterexample), the fallback
+  behaviors, and the settings/cache keying. Start here before changing the
+  sidebar first-paint path, the candidate window, or the session-list cache
+  ownership.
 
 When a change touches streaming, recovery, replay, compression, context
 reconstruction, cancellation, approval/clarify, session metadata, or run state,
