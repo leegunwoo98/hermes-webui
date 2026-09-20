@@ -7,8 +7,6 @@ per request. The badge is display-only, so the string is now memoized per
 (channel, repo) for a short TTL — bounded, and the response shape is unchanged.
 """
 
-import time
-
 import pytest
 
 import api.updates as updates
@@ -83,6 +81,9 @@ def test_channel_version_badge_value_unchanged_by_memoization(monkeypatch):
 
     assert updates.channel_version_badge("stable") == "v9.9.9-dirty-deadbeef"
     assert updates.channel_version_badge("stable") == "v9.9.9-dirty-deadbeef"
+    assert len(_describes(calls)) == 1, (
+        "the dirty-suffixed value must be memoized like the clean one"
+    )
 
 
 def test_channel_version_badge_falls_back_to_webui_version_and_memoizes_it(monkeypatch):
