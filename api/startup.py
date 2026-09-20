@@ -169,13 +169,34 @@ def start_cold_start_warmup():
 def _run_cold_start_warmup() -> dict:
     """Warm the first-paint caches once; returns per-component stats.
 
-    Never raises. Session list: claims the real default-shape cache key and
-    drives the same builder the route uses, as a background rebuild — the
-    builder writes what the request path already writes (the session index /
-    sidecars), not state.db.
+    Never raises.
+
+    Models: ``warm_models_catalog_provenance_if_cold()`` only — the disk-cache
+    provenance publish. Deliberately NOT ``get_available_models()``: that can
+    hold ``_available_models_cache_lock`` + ``_cache_build_in_progress`` for up
+    to 60 s (waiting on an in-flight live probe), which would make the first
+    user ``/api/models`` slower, not faster. The helper takes the lock
+    non-blocking and reads disk only, so this step is bounded.
+
+    Session list: claims the real default-shape cache key and drives the same
+    builder the route uses, as a background rebuild — the builder writes what
+    the request path already writes (the session index / sidecars), not state.db.
     """
     started = time.monotonic()
     stats: dict = {}
+
+    t0 = time.monotonic()
+    try:
+        from api.config import warm_models_catalog_provenance_if_cold
+
+        warm_models_catalog_provenance_if_cold()
+        status = 'ok'
+    except Exception as exc:
+        status = f'failed ({type(exc).__name__}: {exc})'
+    stats['models_provenance'] = {
+        'status': status,
+        'elapsed_ms': int((time.monotonic() - t0) * 1000),
+    }
 
     t0 = time.monotonic()
     try:
@@ -203,7 +224,9 @@ def _run_cold_start_warmup() -> dict:
     stats['total_ms'] = int((time.monotonic() - started) * 1000)
     print(
         f"[warmup] cold-start warm-up finished in {stats['total_ms']} ms "
-        f"(session_list={stats['session_list']['status']} "
+        f"(models_provenance={stats['models_provenance']['status']} "
+        f"{stats['models_provenance']['elapsed_ms']} ms; "
+        f"session_list={stats['session_list']['status']} "
         f"{stats['session_list']['elapsed_ms']} ms)",
         flush=True,
     )

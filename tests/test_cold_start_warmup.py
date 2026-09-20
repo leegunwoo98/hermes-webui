@@ -18,6 +18,7 @@ drives:
 import io
 import json
 import threading
+import time
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
@@ -266,3 +267,65 @@ def test_warmup_plan_failure_does_not_raise_and_claims_nothing(monkeypatch):
     assert stats["error"] and "settings unavailable" in stats["error"]
     with routes._SESSIONS_CACHE_LOCK:
         assert not routes._SESSIONS_CACHE_INFLIGHT, "a failed plan must not claim a key"
+
+
+# ── models disk-cache warm (B2: disk-only, never the catalog rebuild) ────────
+
+def _stub_session_warm(monkeypatch, status="ok"):
+    monkeypatch.setattr(
+        routes, "warm_default_session_list_cache",
+        lambda **_kw: {"owner": True, "completed": status == "ok",
+                       "elapsed_ms": 1, "error": None, "key": None},
+    )
+
+
+def test_cold_start_warmup_warms_models_provenance_from_disk_once(monkeypatch):
+    calls = []
+    monkeypatch.setattr(config, "warm_models_catalog_provenance_if_cold", lambda: calls.append(1))
+
+    def _boom(*_a, **_k):
+        raise AssertionError("warm-up must never enter the live models catalog rebuild path")
+
+    # get_available_models can hold _available_models_cache_lock +
+    # _cache_build_in_progress for up to 60s; the warm-up must not touch it.
+    monkeypatch.setattr(config, "get_available_models", _boom)
+    _stub_session_warm(monkeypatch)
+
+    stats = startup._run_cold_start_warmup()
+    assert calls == [1], "models provenance must be warmed exactly once per warm-up"
+    assert stats["models_provenance"]["status"] == "ok"
+    assert stats["session_list"]["status"] == "ok"
+
+
+def test_cold_start_warmup_models_warm_never_blocks_on_the_catalog_lock(monkeypatch):
+    """Bounded: the disk warm takes the models lock non-blocking, so a held lock
+    (a concurrent live rebuild) must not delay the warm-up."""
+    old_prov = config._models_cache_provenance
+    config._models_cache_provenance = None
+    got = config._available_models_cache_lock.acquire(blocking=False)
+    assert got, "precondition: could not take the models cache lock"
+    try:
+        _stub_session_warm(monkeypatch)
+        started = time.monotonic()
+        stats = startup._run_cold_start_warmup()
+        elapsed = time.monotonic() - started
+    finally:
+        config._available_models_cache_lock.release()
+        config._models_cache_provenance = old_prov
+    assert elapsed < 2.0, f"models warm blocked on a held catalog lock ({elapsed:.2f}s)"
+    assert stats["models_provenance"]["status"] == "ok"
+
+
+def test_cold_start_warmup_models_failure_is_logged_not_raised(monkeypatch):
+    monkeypatch.setattr(
+        config, "warm_models_catalog_provenance_if_cold",
+        lambda: (_ for _ in ()).throw(RuntimeError("disk warm failed")),
+    )
+    _stub_session_warm(monkeypatch)
+
+    stats = startup._run_cold_start_warmup()  # must not raise
+    assert "failed" in stats["models_provenance"]["status"]
+    assert "disk warm failed" in stats["models_provenance"]["status"]
+    assert stats["session_list"]["status"] == "ok", (
+        "a models failure must not skip the session-list warm"
+    )
