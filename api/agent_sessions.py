@@ -912,23 +912,44 @@ def _fast_candidate_union_cte(
     message rows), then apply the exact key only over that union. The final
     exact sort and the window membership rule are unchanged; only the row set
     the key is evaluated over is bounded. Cost is bounded by the pre-window
-    depth at any store size (measured on the same stores: ~0.5-1.2 ms warm).
+    depth at any store size (measured on the same stores: 0.7-1.6 ms warm,
+    1-98 ms first-in-fresh-process — page-cache dependent).
 
-    The pre-windows are seeds, not a guarantee: each is an ordering the exact
-    top-N tracks closely but need not contain. Empirically the exact top-N over
-    the union equals the exact top-N over all qualifying sessions (checked at
-    the 160-row window on the live-store clone and the 1k/10k/50k fixtures, and
-    pinned by the resumed-session regression tests in
-    ``tests/test_session_candidate_ordering_perf.py``); the residual bound is a
-    session whose only recency evidence (its latest message) lies outside all
-    four pre-windows. The guarantee and its bound are documented in
+    The pre-windows are seeds, not a guarantee. With ``N`` the visible limit,
+    ``W = FAST_SIDEBAR_CANDIDATE_OVERSAMPLE * N`` the candidate window and
+    ``M = FAST_SIDEBAR_PREWINDOW_OVERSAMPLE * W`` the message window, a session
+    is in the union iff it is among the ``W`` largest by
+    ``COALESCE(last_activity_at, started_at)``, among the ``W`` largest by
+    ``started_at``, among the ``W`` largest by ``rowid``, or the session of one
+    of the newest ``M`` message rows. The window over the union equals the
+    exact window over all qualifying sessions iff every session in that exact
+    window satisfies one of those four. A session whose only recency evidence
+    is its messages is seeded by the fourth alone, so it is missed when its
+    newest message is more than ``M`` message rows behind the tail while it
+    fails the three session-row seeds (NULL/stale ``last_activity_at``, old
+    ``started_at``, low rowid). That shape is reachable — a busy period
+    dominated by a few long sessions — and pinned by
+    ``test_candidate_union_bound_drops_a_row_beyond_the_message_window``: at
+    ``N=20`` a target at exact rank 20 whose newest message sits behind 1530
+    newer rows (``M=1280``) is dropped from the fast window while the full
+    reader returns it. On the live store the union's exact top-160 does equal
+    the exact top-160: the three session-row seeds carry it (the message seed
+    covers 15 of 3017 sessions), and the worst exact-top-160 row sits at rank
+    156 of 160 in its best session-row seed — 4 rows of slack at the boundary.
+    No cheap provable bound check exists on this schema: an excluded session's
+    exact key cannot be bounded by the denormalized column (it lags by
+    construction — the resumed/NULL shapes are exactly where) nor by the
+    message window's boundary row (rowid order is not timestamp order on live
+    data, and ``messages(timestamp)`` has no index — a global timestamp-ordered
+    read is a full scan, 0.6-1 s cold on the clone). The bound and its
+    measurements are documented in
     ``docs/architecture/session-list-fast-path.md``.
 
     Returns ``(sql, params)``, or ``(None, [])`` when the store has none of the
     agent's standard sessions indexes (``idx_sessions_effective_activity`` /
     ``idx_sessions_started``) to seed the union with: the caller then keeps the
-    plain exact-key window — the pre-union behaviour — instead of paying a
-    whole-table sort per pre-window.
+    plain exact-key window — the pre-union behaviour, bound with its own
+    parameters — instead of paying a whole-table sort per pre-window.
     """
     pre_windows: list[tuple[str, str]] = []
     pre_params: list[object] = []

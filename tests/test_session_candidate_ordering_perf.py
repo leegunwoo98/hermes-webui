@@ -791,3 +791,123 @@ def test_fast_reader_without_sessions_indexes_uses_the_exact_window_fallback(mon
     # directly so any re-break of the binding list fails here.
     assert list(params) == ["cron", "webhook", "kanban", 160]
     assert normalized.count("?") == len(params)
+
+
+# ---------------------------------------------------------------------------
+# The candidate union's documented residual bound (round-2 finding A-F1).
+#
+# The union is exact when every session in the exact top-8N over all qualifying
+# sessions is seeded by one of the four pre-windows. It is NOT a theorem: a
+# session whose only recency evidence is a message more than 64N message rows
+# behind the tail, and which fails all three session-row seeds, is not seeded —
+# the fast window can then drop a row the full reader (and the pre-union fast
+# reader) returns. The bound, its measured headroom, and this counterexample are
+# documented in ``docs/architecture/session-list-fast-path.md``.
+# ---------------------------------------------------------------------------
+
+BOUND_BASE = 1_790_000_000.0
+
+
+def _build_message_gap_db(path: Path) -> None:
+    """The counterexample for the union's documented bound (see above).
+
+    ``target`` sits at exact rank 20 (19 sessions outrank it) while its newest
+    message is behind 1530 newer message rows — more than the message seed's
+    1280-row window at limit 20 — and it fails the three session-row seeds too
+    (oldest ``started_at``, lowest rowid, NULL ``last_activity_at``).
+    """
+    if path.exists():
+        path.unlink()
+    conn = sqlite3.connect(str(path))
+    conn.executescript(_SCHEMA)
+    message_seq = 0
+
+    def add(sid, started, *, last_activity_at, timestamps):
+        nonlocal message_seq
+        conn.execute(
+            "INSERT INTO sessions (id, source, session_source, title, model, started_at,"
+            " message_count, parent_session_id, ended_at, end_reason, last_activity_at)"
+            " VALUES (?,?,?,?,?,?,?,NULL,NULL,NULL,?)",
+            (sid, "desktop", "desktop", f"title {sid}", "test-model", started,
+             len(timestamps), last_activity_at),
+        )
+        for timestamp in timestamps:
+            message_seq += 1
+            conn.execute(
+                "INSERT INTO messages (id, session_id, role, content, timestamp)"
+                " VALUES (?,?,?,?,?)",
+                (f"msg-{message_seq}", sid, "user", "hi", timestamp),
+            )
+
+    # Inserted first: lowest rowid, oldest started_at, NULL last_activity_at.
+    add("target", BOUND_BASE, last_activity_at=None,
+        timestamps=[BOUND_BASE + 100, BOUND_BASE + 900])
+    # Fillers: newer by started_at/rowid (so they fill those two seeds) but a
+    # low exact key (one old message each) -> they rank below the target.
+    for i in range(200):
+        add(f"filler-{i:03d}", BOUND_BASE + 1000 + i, last_activity_at=BOUND_BASE + 10,
+            timestamps=[BOUND_BASE + 10])
+    # 19 sessions x 70 messages appended AFTER the target's messages: 1330 rows
+    # (> 1280 = 64N) so the message seed covers only them, and their exact keys
+    # outrank the target's (ranks 1-19).
+    for i in range(19):
+        add(f"chatty-{i:02d}", BOUND_BASE + 2000 + i, last_activity_at=None,
+            timestamps=[BOUND_BASE + 1000 + i * 70 + j for j in range(70)])
+    conn.commit()
+    conn.close()
+
+
+def test_candidate_union_bound_drops_a_row_beyond_the_message_window(tmp_path):
+    """Pins the union's documented residual bound on its counterexample shape.
+
+    The fast window drops ``target`` (exact rank 20) because its newest message
+    is outside the 1280-row message seed and every session-row seed misses it,
+    while the full reader — the parity reference and the background rebuild —
+    returns it. This is the accepted trade of the bounded union (a bounded seed
+    set instead of a provable prefix); the shape and its reachability are
+    documented in ``docs/architecture/session-list-fast-path.md``. If a future
+    change makes the union exact for this shape (a deeper/message-ordered seed,
+    or a provable bound check), this test must be updated to assert parity.
+    """
+    db = tmp_path / "state.db"
+    _build_message_gap_db(db)
+    conn = sqlite3.connect(str(db))
+    try:
+        exact_top20 = _top_ids(conn, EXACT_ORDER, 20)
+        exact_top160 = _top_ids(conn, EXACT_ORDER, 160)
+        # All three session-row seeds miss the target ...
+        for order in (CANDIDATE_ORDER, "s.started_at DESC", "s.rowid DESC"):
+            assert "target" not in _top_ids(conn, order, 160), order
+        # ... and so does the message seed (newest 1280 message rows).
+        message_seed = [
+            str(row[0]) for row in conn.execute(
+                "SELECT DISTINCT m.session_id FROM (SELECT m.session_id FROM messages m"
+                " ORDER BY m.rowid DESC LIMIT 1280) m"
+            )
+        ]
+        rows_behind = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE rowid > (SELECT MAX(rowid) FROM messages"
+            " WHERE session_id = 'target')"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    # Fixture sanity: the target is inside the exact window, outside every seed,
+    # and its newest message really is beyond the 64N-row message window.
+    assert exact_top20[-1] == "target"
+    assert "target" in exact_top160
+    assert "target" not in message_seed
+    assert rows_behind == 1530 > 1280
+
+    full_ids = [str(row["id"]) for row in _interactive_rows(db, limit=20)]
+    fast_ids = [str(row["id"]) for row in _fast_interactive_rows(db, limit=20)]
+
+    assert "target" in full_ids
+    assert "target" not in fast_ids
+    assert fast_ids != full_ids
+    # Exactly one row differs: the dropped target, replaced by a filler row.
+    assert len(set(fast_ids) ^ set(full_ids)) == 2
+    assert len(fast_ids) == len(full_ids) == 20
+
+
+
