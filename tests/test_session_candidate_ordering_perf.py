@@ -1,20 +1,24 @@
-"""Slice D — interactive candidate-window ordering: audit (D0) and swap (D1).
+"""Slice D — interactive candidate-window ordering: audit (D0) and exact key (D1).
 
 The interactive CLI/agent pass (``read_importable_agent_session_rows`` with
 ``exclude_sources=("cron", "webhook", "kanban")``) bounds its expensive
 messages join to a recency candidate window of ``limit * 8`` rows (the 8x
-oversample). D0 audits the metric that matters for swapping the CANDIDATE
-ordering from the correlated ``MAX(mx.timestamp)`` subquery to the
-denormalized, indexed ``COALESCE(s.last_activity_at, s.started_at)`` key:
-candidate-window membership drift. The final display
-``ORDER BY COALESCE(MAX(m.timestamp), s.started_at)`` is unchanged by the
-swap, so the only risk is a row the pipeline would surface falling outside the
-candidate window.
+oversample). The candidate ordering must be the exact
+``COALESCE(MAX(mx.timestamp), s.started_at)`` key the display sorts by.
+Ordering the window by the denormalized ``COALESCE(s.last_activity_at,
+s.started_at)`` column instead (an intermediate form of this series) makes the
+window an oversample of a key that *lags* the exact one — upstream #2662 fixed
+exactly that regression ("Long-lived CLI sessions that were resumed days later
+... stay visible in the candidate window", v0.51.102) — and the lag is
+unbounded, so no oversample guarantees the window holds the visible top-N.
+
+D0 audits the metric that matters for that key: candidate-window membership
+drift between the approximate and the exact ordering.
 
 Measured on the live DB by the Slice D review: 0 excluded / 0 extra at the
 160-row window for the 20-row slice (worst pipeline-top-20 rank by the
-candidate key = 19). Re-verified here in a fixture with realistic
-column-vs-join skew (``last_activity_at`` tracks, but lags,
+candidate key = 19) — headroom, not a bound. Re-verified here in a fixture with
+realistic column-vs-join skew (``last_activity_at`` tracks, but lags,
 ``MAX(messages.timestamp)``: 99.6% of live rows differ at all — seconds for
 most rows, but up to ~hours for a handful; live non-NULL median 28.6 s /
 p99 490 s / max 10.85 h, NULL-fallback rows up to 17.77 h):
@@ -207,13 +211,15 @@ def _interactive_rows(db_path: Path, limit: int = 20):
 
 
 def test_candidate_window_membership_drift_zero_at_eight_x_oversample(tmp_path):
-    """D0 audit — fail-closed gate for the D1 swap.
+    """D0 audit — the drift between the approximate and the exact key.
 
     Metric: the pipeline's exact-key top-20/top-160 rows must all be inside the
-    160-row candidate window (8x oversample of the 20-row slice), and no
-    candidate row outside the exact top-160 may take a slot. Measured 0/0/0 on
-    the live DB; asserted here on the fixture (which shows 18/20 rank churn, so
-    the check is not vacuous).
+    160-row candidate window *ordered by the approximate key* (8x oversample of
+    the 20-row slice), and no approximate-key row outside the exact top-160 may
+    take a slot. Measured 0/0/0 on the live DB; asserted here on the fixture
+    (which shows 18/20 rank churn, so the check is not vacuous). Zero drift on
+    this data shape is headroom, not a bound — the window therefore orders by
+    the exact key (D1); see the completeness regression below.
     """
     db = tmp_path / "state.db"
     _build_state_db(db)
@@ -258,17 +264,18 @@ def test_candidate_window_membership_drift_zero_at_eight_x_oversample(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# D1 — the candidate-ordering swap itself.
+# D1 — the candidate-window ordering itself.
 #
-# The candidate clause becomes ``ORDER BY COALESCE(s.last_activity_at,
-# s.started_at) DESC, s.started_at DESC`` (indexed by
-# ``idx_sessions_effective_activity``); the final display ORDER BY stays
-# ``COALESCE(MAX(m.timestamp), s.started_at)``, so the visible top-N is
-# unchanged. Older schemas without ``last_activity_at`` keep the exact
-# correlated-subquery candidate ordering.
+# The candidate clause must be ``ORDER BY COALESCE((SELECT MAX(mx.timestamp)
+# FROM messages mx WHERE mx.session_id = s.id), s.started_at) DESC,
+# s.started_at DESC`` — the exact key the display sorts by. Ordering by the
+# denormalized, indexed ``COALESCE(s.last_activity_at, s.started_at)`` instead
+# makes the window an oversample of a key that lags the exact one, and the lag
+# is unbounded (see the D0 audit above), so a resumed row can rank past the
+# window and be dropped before the exact sort.
 # ---------------------------------------------------------------------------
 
-# The pre-swap candidate selection, re-implemented as the parity reference.
+# The exact candidate selection, re-implemented as the parity reference.
 _OLD_FORM_VISIBLE_SQL = f"""
 WITH candidates AS (
     SELECT s.id
@@ -348,12 +355,15 @@ def _record_connect(monkeypatch, executed):
     monkeypatch.setattr(agent_sessions.sqlite3, "connect", recording_connect)
 
 
-def test_interactive_candidate_window_orders_by_indexed_effective_activity(monkeypatch, tmp_path):
-    """D1: the candidate window is ordered by the denormalized, indexed
-    ``COALESCE(s.last_activity_at, s.started_at)`` key with the
-    ``s.started_at DESC`` tie-breaker. The correlated per-row
-    ``MAX(mx.timestamp)`` subquery is gone from the candidate clause, and the
-    final display ORDER BY stays the exact join-based key."""
+def test_interactive_candidate_window_orders_by_the_exact_activity_key(monkeypatch, tmp_path):
+    """D1: the candidate window is ordered by the exact
+    ``COALESCE(MAX(mx.timestamp), s.started_at)`` key — the same key the display
+    sorts by — with the ``s.started_at DESC`` tie-breaker, and the lagging
+    denormalized column never decides membership.
+
+    The correlated per-row probe resolves through ``idx_messages_session``, so
+    the window stays bounded per row instead of aggregating the whole store.
+    """
     db = tmp_path / "state.db"
     _build_state_db(db)
 
@@ -365,30 +375,35 @@ def test_interactive_candidate_window_orders_by_indexed_effective_activity(monke
     candidate_calls = [(sql, params) for sql, params in executed if "WITH candidates AS" in sql]
     assert candidate_calls, "expected the candidate-window projection SQL"
     candidate_sql, candidate_params = candidate_calls[-1]
+    normalized = " ".join(candidate_sql.split())
 
-    # The swap: indexed expression key + the started_at DESC tie-breaker.
-    assert "COALESCE(s.last_activity_at, s.started_at) DESC" in candidate_sql
-    assert "s.started_at DESC" in candidate_sql
-    # The old correlated per-row subquery is gone from the candidate clause.
-    assert "SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id" not in candidate_sql
+    # The exact key + the started_at DESC tie-breaker in the candidate clause.
+    assert (
+        "ORDER BY COALESCE( (SELECT MAX(mx.timestamp) FROM messages mx "
+        "WHERE mx.session_id = s.id), s.started_at ) DESC, s.started_at DESC"
+    ) in normalized
+    # The lagging denormalized column must not decide window membership.
+    assert "COALESCE(s.last_activity_at" not in normalized
     # The final display ordering stays exact (join-based MAX), unchanged.
-    assert "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC" in candidate_sql
+    assert "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC" in normalized
+    # The window stays the 8x oversample of the visible limit.
+    assert candidate_params[-1] == 160
 
-    # ... and the plan actually uses the expression index, with no correlated
-    # scalar subquery left anywhere in the statement.
+    # ... and the correlated probe is an index search per row — no whole-store
+    # messages scan in the window selection.
     conn = sqlite3.connect(str(db))
     try:
         plan = [str(row[-1]) for row in conn.execute("EXPLAIN QUERY PLAN " + candidate_sql, candidate_params)]
     finally:
         conn.close()
-    assert any("idx_sessions_effective_activity" in line for line in plan), plan
-    assert not any("CORRELATED" in line for line in plan), plan
+    assert any("idx_messages_session" in line for line in plan), plan
+    assert not any("SCAN messages" in line for line in plan), plan
 
 
-def test_swapped_candidate_selection_keeps_visible_top_n_parity_under_skew(tmp_path):
+def test_candidate_selection_keeps_visible_top_n_parity_under_skew(tmp_path):
     """D1(a): with the column and the join disagreeing by seconds (the live
-    shape — 99.6% of rows), the swapped candidate selection yields the same
-    visible top-N as the pre-swap correlated-subquery form."""
+    shape — 99.6% of rows), the reader's candidate selection yields the same
+    visible top-N as the exact reference form."""
     db = tmp_path / "state.db"
     _build_state_db(db)
     conn = sqlite3.connect(str(db))
@@ -472,4 +487,104 @@ def test_candidate_ordering_falls_back_without_last_activity_column(monkeypatch,
     # The missing column is never referenced (it would raise OperationalError,
     # which the caller swallows into an empty sidebar).
     assert all("last_activity_at" not in sql for sql, _params in executed)
+
+
+# ---------------------------------------------------------------------------
+# Window completeness — the candidate window must never drop a row the exact
+# ordering would display, however stale the denormalized activity key is.
+#
+# The 8x oversample is headroom on the approximate key, not a bound (see the D0
+# audit above): a row whose ``last_activity_at`` is missing or hours stale can
+# rank arbitrarily far down by that key while ranking at the top by the exact
+# ``MAX(messages.timestamp)`` the display sorts by. Past the oversample the row
+# fell out of the candidate set BEFORE the exact sort and vanished from the
+# visible slice — the regression upstream fixed in #2662 by ordering the
+# candidate window by the exact key (v0.51.102: "Long-lived CLI sessions that
+# were resumed days later ... stay visible in the candidate window").
+# ---------------------------------------------------------------------------
+
+DRIFT_BASE = 1_700_000_000.0
+
+
+def _build_unbounded_drift_db(path: Path) -> None:
+    """200 fillers newer by every denormalized key + one resumed-old row that is
+    newest by its messages and NULL in ``last_activity_at`` (so its approximate
+    key falls back to its old ``started_at``: candidate rank ~201 of 201)."""
+    if path.exists():
+        path.unlink()
+    conn = sqlite3.connect(str(path))
+    conn.executescript(_SCHEMA)
+    message_seq = 0
+
+    def add(sid, started, *, last_activity_at, timestamps):
+        nonlocal message_seq
+        conn.execute(
+            "INSERT INTO sessions (id, source, session_source, title, model, started_at,"
+            " message_count, parent_session_id, ended_at, end_reason, last_activity_at)"
+            " VALUES (?,?,?,?,?,?,?,NULL,NULL,NULL,?)",
+            (
+                sid,
+                "desktop",
+                "desktop",
+                f"title {sid}",
+                "test-model",
+                started,
+                len(timestamps),
+                last_activity_at,
+            ),
+        )
+        for timestamp in timestamps:
+            message_seq += 1
+            conn.execute(
+                "INSERT INTO messages (id, session_id, role, content, timestamp)"
+                " VALUES (?,?,?,?,?)",
+                (f"msg-{message_seq}", sid, "user", "hi", timestamp),
+            )
+
+    for i in range(200):
+        started = DRIFT_BASE + 1000 + i
+        add(f"filler-{i:03d}", started, last_activity_at=started + 5, timestamps=[started])
+    # Resumed days later: the exact key is the newest message in the store, the
+    # approximate key is the oldest ``started_at`` (NULL column falls back).
+    add("resumed-old", DRIFT_BASE + 10, last_activity_at=None,
+        timestamps=[DRIFT_BASE + 5000, DRIFT_BASE + 5001])
+    conn.commit()
+    conn.close()
+
+
+def _fast_interactive_rows(db_path: Path, limit: int = 20):
+    return agent_sessions.read_fast_sidebar_agent_rows(
+        db_path, limit=limit, exclude_sources=("cron", "webhook", "kanban")
+    )
+
+
+def test_candidate_window_is_complete_for_resumed_rows_beyond_the_oversample(tmp_path):
+    """A resumed-old row must survive the candidate window even when its
+    denormalized activity key ranks it past the 8x oversample.
+
+    Fixture: 200 fillers newer by ``last_activity_at`` plus one row whose
+    ``last_activity_at`` is NULL (candidate rank 201 of 201, outside the
+    160-row window) and whose latest message is the newest in the store (exact
+    rank 1). Both readers project the same window, so the drop hit the fast AND
+    the full sidebar projection.
+    """
+    db = tmp_path / "state.db"
+    _build_unbounded_drift_db(db)
+    conn = sqlite3.connect(str(db))
+    try:
+        approx_window = _top_ids(conn, CANDIDATE_ORDER, 160)
+        exact_top20 = _top_ids(conn, EXACT_ORDER, 20)
+    finally:
+        conn.close()
+
+    # Fixture sanity: the two keys disagree on membership, not just rank — the
+    # approximate window genuinely excludes the exact-top-1 row.
+    assert "resumed-old" not in approx_window
+    assert exact_top20[0] == "resumed-old"
+
+    full_ids = [str(row["id"]) for row in _interactive_rows(db, limit=20)]
+    fast_ids = [str(row["id"]) for row in _fast_interactive_rows(db, limit=20)]
+    assert fast_ids == full_ids
+    assert full_ids[0] == "resumed-old"
+
 

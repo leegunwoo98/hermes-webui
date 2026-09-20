@@ -418,6 +418,40 @@ def test_fast_payload_parity_binds_the_candidate_window(monkeypatch, tmp_path):
     assert "filler-000" not in ids
 
 
+def test_fast_payload_parity_when_drift_exceeds_the_candidate_window(monkeypatch, tmp_path):
+    """A resumed session whose denormalized activity key ranks it past the 8x
+    window must still be in BOTH payloads.
+
+    The window bounds the messages join, not the visible set: ordering it by the
+    lagging ``last_activity_at`` made membership an oversample rather than a
+    bound, so a row with a *missing* column (``NULL`` -> the old ``started_at``)
+    — exact rank 1, approximate rank 201 of 201 — vanished from the fast AND the
+    full projection. The window now orders by the exact key the display sorts
+    by, so both builders keep the row.
+    """
+    fillers = [
+        (f"drift-filler-{i:03d}", "cli", f"Drift filler {i:03d}", T + 1000 + i, None, None, None, 1, {},
+         [("user", T + 1000 + i)])
+        for i in range(200)
+    ]
+    resumed = [(
+        "resumed-null", "cli", "Resumed null", T + 10, None, None, None, 2, {},
+        [("user", T + 5000), ("assistant", T + 5001)],
+    )]
+    _install_fixture(
+        monkeypatch, tmp_path,
+        extra_sessions=fillers + resumed,
+        last_activity_null=("resumed-null",),
+    )
+    full = _build_full()
+    fast = _build_fast()
+    _assert_payload_parity(full, fast)
+    ids = [r["session_id"] for r in fast["sessions"]]
+    # Present at all, and newest by exact recency, so it leads the slice.
+    assert "resumed-null" in ids
+    assert ids[0] == "resumed-null"
+
+
 def test_fast_payload_shows_the_tier1_state_db_count_override(monkeypatch, tmp_path):
     """The fast first paint must apply the tier-1 state.db overlay: a webui
     row's own count (``sessions.message_count``) beats its sidecar.
@@ -549,7 +583,7 @@ def _record_sqlite_connect(monkeypatch):
 def test_fast_payload_window_keeps_exact_counts_and_skips_user_turn_aggregation(monkeypatch, tmp_path):
     """The fast window keeps exact per-candidate counts/recency but must not
     aggregate user turns for the whole candidate set (deferred to a bounded
-    fallback)."""
+    fallback), and it orders by the exact activity key the display sorts by."""
     _install_fixture(monkeypatch, tmp_path)
     statements = _record_sqlite_connect(monkeypatch)
     fast = _build_fast()
@@ -560,21 +594,23 @@ def test_fast_payload_window_keeps_exact_counts_and_skips_user_turn_aggregation(
     for sql in fast_sql:
         assert "LOWER(m.role)" not in sql, f"fast window must not aggregate user turns: {sql[:200]}"
         assert "COUNT(CASE" not in sql
-    window_sql = [s for s in statements if "COALESCE(s.last_activity_at" in s]
-    assert window_sql, "candidate window must order by the indexed effective-activity key"
+        # The window is a prefix of the display order: exact key, never the
+        # lagging denormalized column.
+        assert (
+            "COALESCE((SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),"
+            " s.started_at) DESC" in sql
+        ), f"candidate window must order by the exact activity key: {sql[:200]}"
+        assert "COALESCE(s.last_activity_at" not in sql, (
+            f"the lagging denormalized key must not decide window membership: {sql[:200]}"
+        )
     assert any("COUNT(m.id) AS actual_message_count" in s for s in fast_sql), (
         "the fast window must keep the exact per-candidate message count"
     )
 
 
-def test_fast_payload_counts_exclude_claude_code_jsonl_rows_by_design(monkeypatch, tmp_path):
-    """The documented count divergence: JSONL-scan rows exist only in the full
-    payload's CLI list. The fast payload must not run the scan, so its
-    cli_count/cli_session_count cover the bounded state.db window only — and the
-    client-read visible rows are unaffected."""
-    _install_fixture(monkeypatch, tmp_path)
-
-    jsonl_row = {
+def _jsonl_fixture_row():
+    """One Claude Code JSONL-scan row (only the scan can produce these)."""
+    return {
         "session_id": "claude_code_deadbeefdeadbeefdeadbeef",
         "title": "JSONL transcript",
         "workspace": "/tmp/fixture-workspace",

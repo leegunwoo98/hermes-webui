@@ -718,37 +718,26 @@ def read_importable_agent_session_rows(
             candidate_order_clause = "ORDER BY COALESCE(lm.last_message_at, s.started_at) DESC, s.started_at DESC"
         elif use_messages_join and messages_has_timestamp:
             order_by_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
-            if 'last_activity_at' in session_cols:
-                # Slice D: order the candidate window by the denormalized,
-                # indexed effective-activity key instead of a correlated
-                # per-row MAX(messages.timestamp) subquery. Writers maintain
-                # ``last_activity_at`` alongside ``message_count``. 99.6% of
-                # live rows differ from the exact key at all; the difference is
-                # seconds for most rows but up to ~hours for a handful (live
-                # non-NULL rows: median 28.6 s, p99 490 s, max 10.85 h; NULL
-                # rows falling back to ``started_at``: max 17.77 h), so the 8x
-                # oversample absorbs the drift — see the membership-drift audit
-                # in tests/test_session_candidate_ordering_perf.py and the
-                # comment at ``candidate_limit`` below. The final display
-                # ORDER BY above stays the exact join-based key, so the
-                # visible top-N is unchanged.
-                candidate_order_clause = (
-                    "ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC,\n"
-                    "                    s.started_at DESC"
-                )
-            else:
-                # Older state.db schemas have no ``last_activity_at`` column:
-                # keep the exact correlated-subquery candidate ordering (the
-                # pre-Slice-D behaviour) instead of referencing a missing
-                # column, which would raise OperationalError and (through the
-                # caller's guard) empty the sidebar.
-                candidate_order_clause = (
-                    "ORDER BY COALESCE(\n"
-                    "                        (SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),\n"
-                    "                        s.started_at\n"
-                    "                    ) DESC,\n"
-                    "                    s.started_at DESC"
-                )
+            # The candidate window MUST order by the exact activity key — the
+            # same ``COALESCE(MAX(m.timestamp), s.started_at)`` the display
+            # sorts by — never by the denormalized ``s.last_activity_at``. The
+            # column tracks the join key but lags it (live: seconds for most
+            # rows, up to ~hours for a handful, NULL-fallback rows up to
+            # 17.8 h), so an oversample of the approximate key is headroom,
+            # never a bound: a session resumed after a long gap ranks at the
+            # top by its latest message while the approximate key ranks it past
+            # the window, and the projection then never sees the row at all
+            # (upstream #2662 fixed exactly that regression). The correlated
+            # subquery resolves per session through ``idx_messages_session``,
+            # so the window stays a bounded per-row probe instead of a
+            # whole-store aggregate.
+            candidate_order_clause = (
+                "ORDER BY COALESCE(\n"
+                "                        (SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),\n"
+                "                        s.started_at\n"
+                "                    ) DESC,\n"
+                "                    s.started_at DESC"
+            )
 
         select_sql = f"""
             SELECT s.id, s.title, s.model, s.message_count,
@@ -776,25 +765,17 @@ def read_importable_agent_session_rows(
             # The sidebar only needs a small visible window. Bound the expensive
             # messages join to a recent-activity candidate set instead of
             # aggregating every historical Hermes state.db session before
-            # slicing in Python. The candidate ordering must include the latest
-            # message timestamp, not only ``started_at``: long-lived CLI sessions
-            # can be resumed days later and should still surface at the top.
+            # slicing in Python. The candidate ordering IS the exact activity
+            # key (see ``candidate_order_clause`` above), so the window is a
+            # strict prefix of the display order and no row the display would
+            # surface can be evicted by a candidate-key approximation.
             #
-            # The window is oversampled 8x (``limit * 8``) because its ordering
-            # key — the denormalized ``COALESCE(last_activity_at, started_at)``
-            # expression — only approximates the exact
-            # ``COALESCE(MAX(m.timestamp), started_at)`` the final display order
-            # uses. The bound: a row whose candidate-key rank is worse than the
-            # window is silently dropped from the visible slice (the projection
-            # only ever sees the window). Audited on the live DB and in the D0
-            # fixture (tests/test_session_candidate_ordering_perf.py): zero
-            # pipeline top-20/top-160 rows fall outside the 160-row window,
-            # worst top-20 candidate rank 20 (~140 slots of margin for the
-            # display) and worst top-160 rank exactly 160 — zero slack at the
-            # audit edge, so the oversample is the current headroom, not a
-            # guaranteed bound. The window also preserves room for hidden
-            # compression segments or other rows filtered after projection.
-            # Widen ``candidate_limit`` if a future data shape shows drift.
+            # The window is still oversampled 8x (``limit * 8``): it is the
+            # headroom for candidate rows the projection drops after the window
+            # (zero-message rows, collapsed compression segments, invisible
+            # CLI/ACP rows) — those consume candidate slots without rendering.
+            # Widen ``candidate_limit`` if a future data shape filters more
+            # than that out of the newest candidates.
             candidate_limit = max(result_limit * 8, result_limit)
             if latest_messages_cte:
                 candidate_cte = (
@@ -951,8 +932,9 @@ def read_fast_sidebar_agent_rows(
 ) -> list[dict]:
     """Bounded first-paint variant of :func:`read_importable_agent_session_rows`.
 
-    Same candidate window (indexed ``COALESCE(s.last_activity_at, s.started_at)
-    DESC, s.started_at DESC`` with the 8x oversample), the same
+    Same candidate window (exact ``COALESCE(MAX(mx.timestamp), s.started_at)
+    DESC, s.started_at DESC`` with the 8x oversample — the same key and the same
+    completeness guarantee as the full reader), the same
     ``_project_agent_session_rows`` compression/continuation collapse, the same
     ``_with_normalized_source`` flags, the same ``is_cli_session_row_visible``
     filter and the same subagent-parent re-add — only the user-turn aggregation
@@ -1079,13 +1061,10 @@ def read_fast_sidebar_agent_rows(
             where_clauses.append(f"s.id IN ({placeholders})")
             params.extend(wanted_ids)
 
-        if 'last_activity_at' in session_cols and use_messages_join and messages_has_timestamp:
-            candidate_order_clause = (
-                "ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC, s.started_at DESC"
-            )
-        elif use_messages_join and messages_has_timestamp:
-            # Older schemas without the denormalized column: the exact
-            # correlated key is the pre-Slice-D candidate ordering.
+        if use_messages_join and messages_has_timestamp:
+            # Same exact candidate key as the full reader (and the same
+            # guarantee): the window must be a prefix of the display order, not
+            # an oversample of the lagging ``s.last_activity_at``.
             candidate_order_clause = (
                 "ORDER BY COALESCE((SELECT MAX(mx.timestamp) FROM messages mx "
                 "WHERE mx.session_id = s.id), s.started_at) DESC, s.started_at DESC"
