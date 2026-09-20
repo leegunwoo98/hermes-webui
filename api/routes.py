@@ -3039,40 +3039,103 @@ def _get_cached_session_list_payload(
 _WARMUP_MAX_PROFILES = 4
 
 
+def _warmup_profile_recency_ns(path) -> int:
+    """Newest mtime among a profile's own session-store artifacts (0 when none).
+
+    Used only to ORDER the warm-up's remaining profiles, most recently used first.
+    The registry row already carries the profile home (``list_profiles_api()``),
+    so this reads data the registry points at — no new store. Deliberately NOT
+    ``state.db-shm`` (any reader touches it, including this warm-up's own reads,
+    which would make every warmed profile look recently used) and NOT the profile
+    home directory itself (the WebUI's per-profile ``webui_state`` resolution can
+    create entries in it, so its mtime measures setup, not use).
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return 0
+    try:
+        home = Path(raw).expanduser()
+    except Exception:
+        return 0
+    newest = 0
+    for candidate in (home / "state.db", home / "state.db-wal", home / "sessions"):
+        try:
+            newest = max(newest, int(candidate.stat().st_mtime_ns))
+        except OSError:
+            continue
+    return newest
+
+
 def _warmup_profile_names() -> tuple[list[str], int]:
-    """Return (profile names to warm, profiles known before the cap).
+    """Return (profile names to warm IN WARM ORDER, profiles known pre-cap).
+
+    Order: the sticky/active profile first — the ``active_profile`` file
+    ``init_profile_state()`` reads at startup and process-wide switches write, i.e.
+    the profile the user last switched to and the best available guess at the one a
+    returning browser's ``hermes_profile`` cookie names — then the process default,
+    then the remaining registry profiles by most-recently-used
+    (``_warmup_profile_recency_ns``; ties keep the registry's own order).
 
     The warm-up runs on a daemon thread with no request context, so
     ``get_active_profile_name()`` resolves the process default there — while a
     real ``/api/sessions`` request resolves the browser's ``hermes_profile``
     cookie via ``server.py`` → ``set_request_profile()``. Enumerating the same
-    registry surface the profile switcher uses (``list_profiles_api()``) means
-    any cookie value a user can actually hold hits a warmed slot. The process
-    default is always first and always included (even if the registry call
-    fails); the result is bounded to ``_WARMUP_MAX_PROFILES``.
+    registry surface the profile switcher uses (``list_profiles_api()``) means any
+    cookie value a user can actually hold hits a warmed slot.
+
+    The process default is always included (even if the registry call fails); the
+    sticky name is honored only when the registry reports it, so a stale
+    ``active_profile`` cannot burn one of the capped slots. The result is bounded
+    to ``_WARMUP_MAX_PROFILES`` and ``known`` is the pre-cap count.
     """
     from api import profiles as profiles_api
 
-    names: list[str] = []
+    ordered: list[str] = []
 
     def _add(name) -> None:
         normalized = str(name or "").strip()
-        if normalized and normalized not in names:
-            names.append(normalized)
+        if normalized and normalized not in ordered:
+            ordered.append(normalized)
 
+    sticky: str | None = None
     try:
-        _add(profiles_api.get_active_profile_name())
+        sticky = profiles_api.get_sticky_active_profile_name()
     except Exception:
-        _add("default")
+        sticky = None
+
+    process_default: str
     try:
-        for row in profiles_api.list_profiles_api() or []:
-            if isinstance(row, dict):
-                _add(row.get("name"))
-            else:
-                _add(getattr(row, "name", None))
+        process_default = profiles_api.get_active_profile_name()
     except Exception:
-        pass  # best-effort: the process default is always warmed
-    return names[:_WARMUP_MAX_PROFILES], len(names)
+        process_default = "default"
+
+    rows: list = []
+    try:
+        rows = list(profiles_api.list_profiles_api() or [])
+    except Exception:
+        rows = []  # best-effort: the process default is always warmed
+
+    registry_names: list[str] = []
+    recency: dict[str, int] = {}
+    for row in rows:
+        if isinstance(row, dict):
+            name, path = row.get("name"), row.get("path")
+        else:
+            name, path = getattr(row, "name", None), getattr(row, "path", None)
+        normalized = str(name or "").strip()
+        if not normalized or normalized in recency:
+            continue
+        registry_names.append(normalized)
+        recency[normalized] = _warmup_profile_recency_ns(path)
+
+    if sticky and sticky in recency:
+        _add(sticky)
+    _add(process_default)
+    # Stable sort: profiles with equal recency (or no session store at all) keep
+    # the registry's own enumeration order.
+    for name in sorted(registry_names, key=lambda candidate: -recency[candidate]):
+        _add(name)
+    return ordered[:_WARMUP_MAX_PROFILES], len(ordered)
 
 
 def _warmup_key_has_fresh_entry(profile: str, key: tuple) -> bool:
@@ -3128,6 +3191,20 @@ def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
     else ``ok`` if at least one landed, else ``skipped``; ``profiles_warmed``
     counts the ``ok`` slots.
 
+    Warm order and budget: profiles are warmed ONE AT A TIME, in the order
+    ``_warmup_profile_names`` returns (sticky/active first, then the process
+    default, then most-recently-used), and each profile's wait is bounded to its
+    OWN slice of what is left of the overall deadline — ``wait_timeout`` divided by
+    the number of profiles still to warm (with the shipped ``_WARMUP_MAX_PROFILES``
+    cap of 4 and ``_WARMUP_SESSION_WAIT_SECONDS = 30.0`` that is at least 7.5 s
+    each; budget a fast profile leaves unused is redistributed to the ones behind
+    it). Serializing matters on a loaded box: four concurrent rebuilds under one
+    shared deadline contend with each other and with the first real request, and a
+    single slow profile would otherwise consume the whole window. Each entry also
+    carries the ``slice_seconds`` it was given, and ``profiles`` is in warm order.
+    A profile whose build is still running when its slice expires keeps its claim:
+    the slot fills later, and the honest outcome is ``timeout``.
+
     Never raises: the returned stats dict carries the outcome for logging. The
     builder writes what the request path already writes (the session index /
     sidecars); it does not write state.db.
@@ -3153,7 +3230,7 @@ def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
         stats["capped"] = known > len(names)
         deadline = started + wait_timeout
         entries: list[dict] = []
-        claims: list[tuple[dict, threading.Event]] = []
+        planned: list[tuple[str, tuple, dict]] = []
         seen_keys: set = set()
         for name in names:
             key, builder_kwargs = _session_list_cache_request_plan(
@@ -3162,6 +3239,8 @@ def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
             if key in seen_keys:
                 continue
             seen_keys.add(key)
+            planned.append((name, key, builder_kwargs))
+        for index, (name, key, builder_kwargs) in enumerate(planned):
             event, is_owner = _session_list_cache_claim_rebuild(key)
             entry = {
                 "profile": name,
@@ -3172,22 +3251,22 @@ def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
                 "status": "pending",
             }
             entries.append(entry)
-            if is_owner:
-                _start_session_list_cache_background_rebuild(
-                    key,
-                    event,
-                    functools.partial(_build_session_list_cache_payload, **builder_kwargs),
-                    profile=name,
-                )
-            claims.append((entry, event))
-        for entry, event in claims:
-            if not entry["owner"]:
+            if not is_owner:
                 entry["status"] = "skipped"
                 continue
-            if not entry["completed"]:
-                entry["completed"] = bool(
-                    event.wait(max(0.0, deadline - time.monotonic()))
-                )
+            # Serialized: this profile's rebuild is started only now, so it runs
+            # alone instead of contending with the profiles behind it.
+            _start_session_list_cache_background_rebuild(
+                key,
+                event,
+                functools.partial(_build_session_list_cache_payload, **builder_kwargs),
+                profile=name,
+            )
+            slice_seconds = max(0.0, deadline - time.monotonic()) / max(
+                1, len(planned) - index
+            )
+            entry["slice_seconds"] = round(slice_seconds, 3)
+            entry["completed"] = bool(event.wait(slice_seconds))
             if not entry["completed"]:
                 entry["status"] = "timeout"
                 continue

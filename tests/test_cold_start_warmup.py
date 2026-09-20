@@ -9,6 +9,11 @@ drives:
     ``sidebar_source=webui`` + ``exclude_hidden=1``), and nothing else;
   * an already-owned key is never re-claimed with a home-made event;
   * the claimed event is completed and the claim released (no leaked waiter);
+  * the warm order (sticky/active profile, then the process default, then the
+    most-recently-used remaining profiles) and the serialized per-profile budget
+    (one rebuild at a time, each wait bounded to its own slice of the deadline);
+  * the route's own stale-path background rebuild runs under the profile its cache
+    key names, so the entry it stores is fresh for that profile;
   * failures are logged, never raised, and never leave a claim behind;
   * the models warm is the disk-only provenance helper, once, and never enters
     the live catalog rebuild path (``_available_models_cache_lock`` /
@@ -17,6 +22,7 @@ drives:
 
 import io
 import json
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -121,6 +127,56 @@ def _pin_warmup_profiles(monkeypatch, names, known=None):
         routes, "_warmup_profile_names",
         lambda: (list(names), known if known is not None else len(names)),
     )
+
+
+def _profile_rows(*names, tmp_path=None):
+    """Registry rows (name + path) for the given profiles."""
+    return [
+        {"name": name, "path": str(tmp_path / name) if tmp_path is not None else None}
+        for name in names
+    ]
+
+
+def _touch_session_store(home, *, age_seconds: float) -> None:
+    """Give a profile home a ``state.db`` with a chosen age (the recency signal)."""
+    home.mkdir(parents=True, exist_ok=True)
+    db = home / "state.db"
+    db.write_bytes(b"x")
+    stamp = time.time() - age_seconds
+    os.utime(db, (stamp, stamp))
+
+
+def _install_slow_builder(monkeypatch, *, slow_profiles, gate):
+    """Wrap the real builder: record per-profile start/end and park the slow ones.
+
+    A slow profile's build blocks on ``gate`` (the test releases it at the end so
+    no build outlives the test body); the others take a small but real amount of
+    time, so a slice has something to bound.
+    """
+    real_build = routes._build_session_list_cache_payload
+    builds: dict[str, dict] = {}
+
+    def _build(**kwargs):
+        name = kwargs.get("active_profile")
+        record = builds.setdefault(name, {"start": None, "end": None, "calls": 0})
+        record["start"] = time.monotonic()
+        record["calls"] += 1
+        if name in slow_profiles:
+            gate.wait(10.0)
+        else:
+            time.sleep(0.02)
+        record["end"] = time.monotonic()
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(routes, "_build_session_list_cache_payload", _build)
+    return builds
+
+
+def _warm_rows(*profiles):
+    return [
+        {**_rows()[0], "session_id": f"webui-{name}", "profile": name}
+        for name in profiles
+    ]
 
 
 def _route_key_for_query(query: str, settings: dict | None = None) -> tuple:
@@ -258,8 +314,59 @@ def test_warmup_does_not_claim_or_fill_a_wrong_shape_key(monkeypatch):
 
 # ── profile coverage (P1): every profile a cookie can name gets a warm slot ──
 
+def test_warmup_profile_names_sticky_first_then_default_then_recency(monkeypatch, tmp_path):
+    """Warm order: sticky/active profile, then the process default, then the rest
+    most-recently-used — the registry rows' own session-store mtime, no new store.
+
+    The cap takes that order's prefix, so it keeps the sticky profile and the
+    most-recently-used names instead of `default` + the alphabetically-first ones.
+    """
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(profiles, "get_sticky_active_profile_name", lambda: "beta")
+    monkeypatch.setattr(
+        profiles, "list_profiles_api",
+        lambda: _profile_rows(
+            "default", "alpha", "beta", "gamma", "delta", tmp_path=tmp_path,
+        ),
+    )
+    _touch_session_store(tmp_path / "alpha", age_seconds=60)
+    _touch_session_store(tmp_path / "beta", age_seconds=300)
+    _touch_session_store(tmp_path / "gamma", age_seconds=600)
+    _touch_session_store(tmp_path / "delta", age_seconds=7200)
+
+    names, known = routes._warmup_profile_names()
+    assert names == ["beta", "default", "alpha", "gamma"], (
+        "warm order must be sticky/active first, then the process default, then "
+        "the most-recently-used remaining profiles — and the cap must keep those, "
+        "not the alphabetically-first names"
+    )
+    assert known == 5, "the pre-cap count is returned so callers can log the cap"
+    assert len(names) <= routes._WARMUP_MAX_PROFILES
+    # The least-recently-used profile is the one the cap drops. (An alphabetical
+    # cap would have warmed default, alpha, beta, delta: no sticky profile, no
+    # gamma.)
+    assert "delta" not in names
+
+
+def test_warmup_profile_names_skips_a_sticky_name_the_registry_does_not_report(
+    monkeypatch, tmp_path,
+):
+    """A stale ``active_profile`` must not burn one of the capped warm slots."""
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(profiles, "get_sticky_active_profile_name", lambda: "ghost")
+    monkeypatch.setattr(
+        profiles, "list_profiles_api",
+        lambda: _profile_rows("default", "alpha", tmp_path=tmp_path),
+    )
+
+    names, known = routes._warmup_profile_names()
+    assert names == ["default", "alpha"]
+    assert known == 2
+
+
 def test_warmup_profile_names_default_first_deduped_and_capped(monkeypatch):
     monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(profiles, "get_sticky_active_profile_name", lambda: "default")
     rows = [{"name": "default"}, {"name": "default"}] + [
         {"name": f"p{i}"} for i in range(1, 8)
     ]
@@ -276,6 +383,7 @@ def test_warmup_profile_names_default_first_deduped_and_capped(monkeypatch):
 
 def test_warmup_profile_names_fall_back_to_the_process_default(monkeypatch):
     monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "rooty")
+    monkeypatch.setattr(profiles, "get_sticky_active_profile_name", lambda: "ghost")
     monkeypatch.setattr(
         profiles, "list_profiles_api",
         lambda: (_ for _ in ()).throw(RuntimeError("registry unavailable")),
@@ -485,6 +593,129 @@ def test_stale_route_rebuild_stores_under_the_key_profile(monkeypatch):
     assert fresh is True and payload is not None, (
         "the rebuilt entry must be fresh for the profile that key belongs to"
     )
+
+
+# ── serialized rebuilds with a per-profile slice (B-R2) ──────────────────────
+
+def test_warmup_serializes_rebuilds_and_keeps_the_first_slot_warm(monkeypatch):
+    """One profile at a time, in warm order: a later profile that exhausts the
+    deadline cannot cost the first (sticky) profile its slot.
+
+    Before: every profile's rebuild was launched up front and waited on against
+    ONE shared deadline, so on a loaded box the builds contended with each other
+    (and with the first real request) and everything behind a slow profile timed
+    out. Now the sticky profile is warmed first, alone, and a slow profile burns
+    only its own slice of what is left.
+    """
+    _install_route_stubs(monkeypatch)
+    _pin_warmup_profiles(monkeypatch, ["alpha", "default", "beta"])
+    rows = _warm_rows("alpha", "default", "beta")
+    monkeypatch.setattr(
+        routes, "all_sessions", lambda diag=None, **_kw: [dict(r) for r in rows]
+    )
+    gate = threading.Event()
+    builds = _install_slow_builder(monkeypatch, slow_profiles={"beta"}, gate=gate)
+
+    stats = routes.warm_default_session_list_cache(wait_timeout=1.2)
+    try:
+        assert [entry["profile"] for entry in stats["profiles"]] == ["alpha", "default", "beta"], (
+            "the warm-up must warm in the order it enumerates (sticky/active first)"
+        )
+        assert [entry["status"] for entry in stats["profiles"]] == ["ok", "ok", "timeout"]
+        assert stats["status"] == "timeout", "a timed-out profile must be reported, not hidden"
+        assert stats["profiles_warmed"] == 2
+        assert stats["profiles_considered"] == 3
+        # Serialized: each build started only after the previous profile settled.
+        assert builds["alpha"]["end"] <= builds["default"]["start"]
+        assert builds["default"]["end"] <= builds["beta"]["start"]
+        assert builds["beta"]["calls"] == 1, "a timed-out profile must not be rebuilt"
+        # The budget the two fast profiles left unused went to the slow one.
+        assert stats["profiles"][2]["slice_seconds"] > 0.5
+
+        # The sticky profile's slot is the one a cookie request reads — no rebuild.
+        profiles.set_request_profile("alpha")
+        try:
+            alpha_key = _route_key_for_query("sidebar_source=webui&exclude_hidden=1")
+            assert any(entry["key"] == alpha_key for entry in stats["profiles"])
+            warmed_calls = builds["alpha"]["calls"]
+            handler = _handle_sessions(
+                "http://example.com/api/sessions?sidebar_source=webui&exclude_hidden=1"
+            )
+        finally:
+            profiles.clear_request_profile()
+        assert handler.status == 200
+        assert [row["session_id"] for row in handler.json_body()["sessions"]] == ["webui-alpha"]
+        assert builds["alpha"]["calls"] == warmed_calls, (
+            "the sticky profile's request rebuilt instead of reading the warmed slot"
+        )
+    finally:
+        gate.set()
+        assert _wait_for_claim_release(stats["profiles"][2]["key"]), (
+            "the parked slow build never released its claim"
+        )
+
+
+def test_warmup_slow_first_profile_does_not_starve_the_rest(monkeypatch):
+    """Each profile's wait is bounded to its OWN slice of the deadline, so a slow
+    first profile cannot consume the window the profiles behind it need."""
+    _install_route_stubs(monkeypatch)
+    _pin_warmup_profiles(monkeypatch, ["alpha", "default", "beta"])
+    rows = _warm_rows("alpha", "default", "beta")
+    monkeypatch.setattr(
+        routes, "all_sessions", lambda diag=None, **_kw: [dict(r) for r in rows]
+    )
+    gate = threading.Event()
+    _install_slow_builder(monkeypatch, slow_profiles={"alpha"}, gate=gate)
+
+    stats = routes.warm_default_session_list_cache(wait_timeout=1.2)
+    try:
+        assert [entry["status"] for entry in stats["profiles"]] == ["timeout", "ok", "ok"]
+        assert stats["profiles_warmed"] == 2
+        # 1.2 s over 3 profiles: the first slice is ~0.4 s (its own share, not the
+        # whole window), and the profiles behind it get real slices of their own.
+        assert stats["profiles"][0]["slice_seconds"] <= 0.45
+        assert stats["profiles"][1]["slice_seconds"] >= 0.3
+
+        profiles.set_request_profile("beta")
+        try:
+            beta_key = _route_key_for_query("sidebar_source=webui&exclude_hidden=1")
+            payload, fresh = routes._session_list_cache_get(beta_key, allow_stale=True)
+        finally:
+            profiles.clear_request_profile()
+        assert fresh is True and payload is not None, (
+            "the profiles behind the slow one must still be warmed inside the deadline"
+        )
+        assert [row["session_id"] for row in payload["sessions"]] == ["webui-beta"]
+    finally:
+        gate.set()
+        assert _wait_for_claim_release(stats["profiles"][0]["key"]), (
+            "the parked slow build never released its claim"
+        )
+
+
+def test_cold_start_warmup_logs_the_warm_order_and_the_honest_outcome(monkeypatch, capsys):
+    """The [warmup] line carries the warm order plus the real per-profile outcome."""
+    _install_route_stubs(monkeypatch)
+    _stub_models_warm(monkeypatch)
+    _pin_warmup_profiles(monkeypatch, ["alpha", "default", "beta"])
+    rows = _warm_rows("alpha", "default", "beta")
+    monkeypatch.setattr(
+        routes, "all_sessions", lambda diag=None, **_kw: [dict(r) for r in rows]
+    )
+    gate = threading.Event()
+    _install_slow_builder(monkeypatch, slow_profiles={"beta"}, gate=gate)
+    monkeypatch.setattr(startup, "_WARMUP_SESSION_WAIT_SECONDS", 1.2)
+
+    stats = startup._run_cold_start_warmup()
+    out = capsys.readouterr().out
+    gate.set()
+    assert _wait_for_claim_release(stats["session_list"]["profiles"][2]["key"])
+
+    assert stats["session_list"]["status"] == "timeout"
+    assert "session_list=timeout" in out
+    assert "session_list=ok" not in out
+    assert "profiles=2/3" in out
+    assert "order=alpha,default,beta" in out
 
 
 # ── failure containment ──────────────────────────────────────────────────────

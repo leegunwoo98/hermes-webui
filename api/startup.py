@@ -17,7 +17,9 @@ _SENSITIVE_FILES = (
 _WARMUP_DISABLE_ENV = 'HERMES_WEBUI_NO_WARMUP'
 # Upper bound the warm thread waits for the session-list rebuild before it logs
 # and gives up. It never blocks readiness (daemon thread) and the claim stays
-# with the background rebuild either way, so waiters are still released.
+# with the background rebuild either way, so waiters are still released. The
+# routes-side warm-up splits this budget into per-profile slices and warms one
+# profile at a time, so a single slow profile cannot consume the whole window.
 _WARMUP_SESSION_WAIT_SECONDS = 30.0
 _warmup_lock = threading.Lock()
 _warmup_started = False
@@ -255,6 +257,16 @@ def _run_cold_start_warmup() -> dict:
         )
         if session_list['capped']:
             session_detail += f" (capped of {session_list['profiles_known']} known)"
+        # The warm order (sticky/active first, then the process default, then
+        # most-recently-used) — the per-profile outcome is the profiles= ratio
+        # above, so an operator can tell which profile was warmed first.
+        order = ",".join(
+            str(entry.get("profile"))
+            for entry in session_list['profiles']
+            if isinstance(entry, dict) and entry.get("profile")
+        )
+        if order:
+            session_detail += f" order={order}"
     print(
         f"[warmup] cold-start warm-up finished in {stats['total_ms']} ms "
         f"(models_provenance={stats['models_provenance']['status']} "
