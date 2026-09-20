@@ -8439,9 +8439,9 @@ def get_cli_sessions(
 
     if fast_window and not all_profiles:
         # Never read or write the models-layer CLI cache on the fast window: a
-        # stored fast list would be served to the full builder (missing the
-        # Claude Code scan's rows) and a stored full list would defeat the fast
-        # path. The background full rebuild is the only writer of that cache.
+        # stored fast list is a bounded window the full builder must not serve,
+        # and a stored full list would defeat the fast path. The background full
+        # rebuild is the only writer of that cache.
         try:
             return _load_sessions()
         except Exception as _cli_err:
