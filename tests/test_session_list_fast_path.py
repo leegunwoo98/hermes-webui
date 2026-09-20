@@ -600,9 +600,9 @@ def test_fast_payload_window_keeps_exact_counts_and_skips_user_turn_aggregation(
     for sql in fast_sql:
         assert "LOWER(m.role)" not in sql, f"fast window must not aggregate user turns: {sql[:200]}"
         assert "COUNT(CASE" not in sql
-        # The window is a prefix of the display order: the candidates CTE's
-        # membership/order is the exact key, applied only over the bounded
-        # pre-window union.
+        # The window is the display order's prefix over the seeded candidate set
+        # (not over all sessions): the candidates CTE's membership/order is the
+        # exact key, applied only over the bounded pre-window union.
         assert (
             "COALESCE((SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),"
             " s.started_at) DESC" in sql

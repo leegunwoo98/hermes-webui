@@ -940,9 +940,10 @@ def _fast_candidate_union_cte(
     exact key cannot be bounded by the denormalized column (it lags by
     construction — the resumed/NULL shapes are exactly where) nor by the
     message window's boundary row (rowid order is not timestamp order on live
-    data, and ``messages(timestamp)`` has no index — a global timestamp-ordered
-    read is a full scan, 0.6-1 s cold on the clone). The bound and its
-    measurements are documented in
+    data — on a clone snapshot, 403 rows inside the newest 5,000 have a
+    newer-timestamped row before them — and ``messages(timestamp)`` has no
+    index, so a global timestamp-ordered read is a full scan of the store).
+    The bound and its measurements are documented in
     ``docs/architecture/session-list-fast-path.md``.
 
     Returns ``(sql, params)``, or ``(None, [])`` when the store has none of the

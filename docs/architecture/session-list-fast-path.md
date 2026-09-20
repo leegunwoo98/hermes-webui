@@ -112,16 +112,20 @@ behavior and changes no runtime behavior.
   exact key needs either the denormalized column (unsound: it lags by
   construction, and the resumed/NULL shapes are exactly where it lags) or a
   global timestamp-ordered read of `messages` (there is no `messages(timestamp)`
-  index, so it is a full scan of the 505k-row table — 0.6-1 s cold / ~20 ms warm
-  for a bare aggregate on the clone, 12-23 s in the rowid-filtered form — and
-  rowid order is not timestamp order there: `MAX(timestamp)` over `rowid < R` is
-  3680 s newer than the timestamp at `R`). A competitor bound built from the
-  pre-window boundaries fires on every live request while the union is in fact
-  exact (measured at limit 20: the 160th candidate's key 1789641220 < the 1281st
-  newest message's timestamp 1789880658; limits 100/200 likewise), i.e. it would
-  always pay the exact-over-all window this path exists to avoid. The
-  counterexample above is therefore documented and pinned rather than "proved
-  away".
+  index, so it is a full scan of the 505k-row table — measured warm on a
+  read-only clone: ~80-145 ms for a bare `MAX(timestamp)`, ~26-31 ms for
+  `ORDER BY timestamp DESC LIMIT 1`, ~0.4-2.2 s for the rowid-filtered form,
+  page-cache dependent — and rowid order is not timestamp order there: 403 rows
+  inside the newest 5,000 have a newer-timestamped row before them, worst
+  3,702 s (97,545 rows overall, worst ~9.9 d; counts are of the clone snapshot
+  and drift as the live store grows, the inversion structure does not). A
+  competitor bound built from the pre-window boundaries fires on every live
+  request while the union is in fact exact (measured on the clone at limits
+  20/100/200: the window's last candidate key sits days below the
+  message-boundary timestamp that dominates the bound, so the bound check fires
+  at every limit), i.e. it would always pay the exact-over-all window this path
+  exists to avoid. The counterexample above is therefore documented and pinned
+  rather than "proved away".
 - The session-row seeds require the agent's standard indexes
   (`idx_sessions_effective_activity` / `idx_sessions_started`). Without them the
   plain exact-key window runs — the pre-union behavior, bound with its own
@@ -149,13 +153,16 @@ behavior and changes no runtime behavior.
   to the full reader.
 - A read-only open failure returns an empty list (the fast reader must never
   create or write the store; the full reader instead falls back to a writable
-  open, so the two can diverge on a store only a writable open can reach — e.g.
-  WAL shared-memory creation). That request's fast payload carries no CLI/agent
-  rows until the background full rebuild lands: the same transient divergence
-  class as the bound above, and the one remaining silent-degradation path on
-  this reader, kept because the fast path must not create the store.
-- The fast reader never writes: read-only open, no defensive index self-heal, no
-  tombstone/prune bookkeeping — the full rebuild owns those.
+  open, so where the read-only open fails but the writable open succeeds, the
+  full reader still reads rows the fast reader omits). That request's fast
+  payload carries no CLI/agent rows until the background full rebuild lands:
+  the same transient divergence class as the bound above, and the one remaining
+  silent-degradation path on this reader, kept because the fast path must not
+  create the store.
+- The fast reader never writes the store: read-only open, no defensive index
+  self-heal, no tombstone/prune bookkeeping — the full rebuild owns those
+  (SQLite itself may create the store's `-shm`/`-wal` sidecars when it first
+  opens a WAL store; that is the open, not a reader write).
 
 ## Settings keying
 
