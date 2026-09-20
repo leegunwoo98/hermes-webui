@@ -191,8 +191,8 @@ def _install_fixture(monkeypatch, tmp_path, *, last_activity_lag=None, last_acti
     monkeypatch.setattr(routes, "_active_state_db_path", lambda: tmp_path / "state.db", raising=False)
     # Never mint projects / touch workspace state from a fixture build.
     monkeypatch.setattr(models, "ensure_cron_project", lambda **_kw: "cron-project", raising=False)
-    monkeypatch.setattr(models, "ensure_webhook_project", lambda: "webhook-project", raising=False)
-    monkeypatch.setattr(models, "_profile_has_user_projects", lambda: True, raising=False)
+    monkeypatch.setattr(models, "ensure_webhook_project", lambda **_kw: "webhook-project", raising=False)
+    monkeypatch.setattr(models, "_profile_has_user_projects", lambda *_a, **_kw: True, raising=False)
     monkeypatch.setattr(models, "get_last_workspace", lambda: "/tmp/fixture-workspace", raising=False)
 
     (state_dir / "settings.json").write_text(json.dumps({

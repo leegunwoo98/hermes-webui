@@ -246,7 +246,7 @@ def test_row_builder_characterization_cron_pass_keeps_raw_fields(monkeypatch, tm
     monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
     monkeypatch.setattr(models.Session, "load_metadata_only", lambda _sid: None)
     monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
-    monkeypatch.setattr(models, "_profile_has_user_projects", lambda: False)
+    monkeypatch.setattr(models, "_profile_has_user_projects", lambda *_a, **_kw: False)
     monkeypatch.setattr(models, "ensure_cron_project", lambda **_: "cron-project-id")
 
     def fake_read_rows(_db_path, **kwargs):
@@ -298,7 +298,7 @@ def test_row_builder_characterization_webhook_and_kanban_passes(monkeypatch, tmp
     monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
     monkeypatch.setattr(models.Session, "load_metadata_only", lambda _sid: None)
     monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
-    monkeypatch.setattr(models, "ensure_webhook_project", lambda: "webhook-project-id")
+    monkeypatch.setattr(models, "ensure_webhook_project", lambda **_kw: "webhook-project-id")
 
     def fake_read_rows(_db_path, **kwargs):
         include = kwargs.get("include_sources")
@@ -556,9 +556,9 @@ def _pin_fixture_environment(monkeypatch, tmp_path, *, db=None):
     monkeypatch.setattr(models, "get_last_workspace", lambda: tmp_path)
     monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
     monkeypatch.setattr(models.Session, "load_metadata_only", lambda _sid: None)
-    monkeypatch.setattr(models, "_profile_has_user_projects", lambda: False)
+    monkeypatch.setattr(models, "_profile_has_user_projects", lambda *_a, **_kw: False)
     monkeypatch.setattr(models, "ensure_cron_project", lambda **_: "cron-project-id")
-    monkeypatch.setattr(models, "ensure_webhook_project", lambda: "webhook-project-id")
+    monkeypatch.setattr(models, "ensure_webhook_project", lambda **_kw: "webhook-project-id")
     monkeypatch.setattr(models, "get_claude_code_sessions", lambda *a, **k: [])
     models.clear_cli_sessions_cache()
     return hermes_home
@@ -837,9 +837,9 @@ def test_lookup_claude_code_jsonl_family_matches_bulk(monkeypatch, tmp_path):
     monkeypatch.setattr(models, "get_last_workspace", lambda: tmp_path)
     monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
     monkeypatch.setattr(models.Session, "load_metadata_only", lambda _sid: None)
-    monkeypatch.setattr(models, "_profile_has_user_projects", lambda: False)
+    monkeypatch.setattr(models, "_profile_has_user_projects", lambda *_a, **_kw: False)
     monkeypatch.setattr(models, "ensure_cron_project", lambda **_: "cron-project-id")
-    monkeypatch.setattr(models, "ensure_webhook_project", lambda: "webhook-project-id")
+    monkeypatch.setattr(models, "ensure_webhook_project", lambda **_kw: "webhook-project-id")
     monkeypatch.setenv("HERMES_WEBUI_CLAUDE_PROJECTS_DIR", str(projects_dir))
     models.clear_cli_sessions_cache()
 
