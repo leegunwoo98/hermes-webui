@@ -2737,15 +2737,18 @@ def _build_session_list_cache_payload(
     )
 
 
-def _fast_sidebar_cli_rows():
+def _fast_sidebar_cli_rows(show_claude_code_sessions: bool = True):
     """Bounded first-paint CLI/agent rows for the active profile.
 
     Goes through the same ``routes.get_cli_sessions`` seam the full builder uses
     (tests and focused callers patch it) with ``fast_window=True``: the loader
     projects ``read_fast_sidebar_agent_rows`` through the exact same mapping
-    (row shape, cron/webhook/kanban chip passes, sidecar metadata, project ids),
-    skips the Claude Code JSONL scan, and never touches the models-layer CLI
-    cache — the background full rebuild is the only writer of that cache. A
+    (row shape, cron/webhook/kanban chip passes, sidecar metadata, project ids)
+    and never touches the models-layer CLI cache — the background full rebuild
+    is the only writer of that cache. ``show_claude_code_sessions`` is threaded
+    through exactly like the full builder's: JSONL-backed rows have no state.db
+    row, so skipping the scan here would drop valid sessions from the first
+    paint while the full builder returns them for the same request shape. A
     monkeypatched/legacy ``get_cli_sessions`` that cannot honor the flag keeps
     its own behavior.
     """
@@ -2753,14 +2756,14 @@ def _fast_sidebar_cli_rows():
         return get_cli_sessions(
             source_filter=None,
             all_profiles=False,
-            include_claude_code=False,
+            include_claude_code=show_claude_code_sessions,
             fast_window=True,
         )
     if _callable_accepts_kwarg(get_cli_sessions, "include_claude_code"):
         return get_cli_sessions(
             source_filter=None,
             all_profiles=False,
-            include_claude_code=False,
+            include_claude_code=show_claude_code_sessions,
         )
     return get_cli_sessions(source_filter=None, all_profiles=False)
 
@@ -2827,7 +2830,10 @@ def _build_session_list_fast_payload(
     * CLI/agent rows: ``read_fast_sidebar_agent_rows`` through the same
       ``_load_cli_sessions_uncached`` mapping (interactive window plus the
       bounded cron/webhook/kanban chip passes at 200 each), active profile only,
-      never the Claude Code JSONL scan.
+      plus the same Claude Code JSONL scan the full builder runs (bounded at
+      ``CLAUDE_CODE_MAX_FILES``, per-file parse cache) whenever the request
+      enables those sessions — JSONL-backed rows have no state.db row, so the
+      two builders must agree on running it or the first paint drops them.
 
     Deliberately NOT run here (the background full rebuild owns them; the route
     cache serves this payload only until it lands): the orphan-sidecar prunes
@@ -2838,13 +2844,12 @@ def _build_session_list_fast_payload(
     ``evidence-slice-c.md``):
 
     * ``user_message_count`` is only filled for rows the visibility filter
-      dropped (the window skips the user-turn CASE);
-    * ``cli_count``/``cli_session_count`` cover only the bounded state.db window:
-      the full payload also counts the Claude Code JSONL scan's rows, which this
-      path must never produce. ``cli_count`` has zero client consumers; the
-      source-tab counts are refreshed by the background full rebuild within its
-      window. Both counts match the full payload whenever no JSONL rows exist
-      (the C3 parity fixture asserts that).
+      dropped (the window skips the user-turn CASE).
+
+    The CLI list is the full builder's for the same request shape — the bounded
+    state.db window plus the JSONL scan's rows — so the session set and the
+    ``cli_count``/``cli_session_count`` fields agree with the full payload (the
+    C3 parity fixture asserts both).
 
     No client-read row field diverges (probe parity on live data: same ids,
     same order, zero field diffs).
@@ -2893,7 +2898,9 @@ def _build_session_list_fast_payload(
     webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
     if show_cli_sessions:
         diag_stage("fast_cli_window")
-        cli = _fast_sidebar_cli_rows()
+        cli = _fast_sidebar_cli_rows(
+            show_claude_code_sessions=bool(show_claude_code_sessions)
+        )
         diag_stage("fast_merge_cli_sessions")
         cli_by_id = {s["session_id"]: s for s in cli}
         webui_sessions = _merge_cli_metadata_into_webui_rows(webui_sessions, cli_by_id)

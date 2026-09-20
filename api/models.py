@@ -7938,14 +7938,16 @@ def _load_cli_sessions_uncached(
     # scan are what wedged the chat-open path. JSONL ``claude_code_*`` ids are
     # resolved separately by ``_lookup_claude_code_session_row``.
     #
-    # ``fast_window`` implies the same skip: the bounded first-paint read is
-    # read-only and windowed by construction, so the unbounded JSONL walk is
-    # never allowed there regardless of the caller's ``include_claude_code``.
+    # ``fast_window`` deliberately does NOT imply that skip: JSONL-backed rows
+    # have no state.db row, so skipping the scan there drops valid sessions from
+    # the fast first paint while the full builder returns them for the same
+    # request shape. The scan is bounded (CLAUDE_CODE_MAX_FILES) and per-file
+    # cached, and the fast window's caller passes the request's own
+    # ``include_claude_code``, so the two builders return the same session set.
     if (
         source_filter in (None, CLAUDE_CODE_SOURCE)
         and include_claude_code
         and session_ids is None
-        and not fast_window
     ):
         try:
             cli_sessions.extend(get_claude_code_sessions())
@@ -8349,10 +8351,10 @@ def get_cli_sessions(
 
     ``fast_window=True`` (Slice C fast first paint) projects the bounded
     ``read_fast_sidebar_agent_rows`` window through the same loader and NEVER
-    touches the models-layer CLI cache: a stored fast list would later be served
-    to the full builder (missing the Claude Code scan's rows), and a stored full
-    list would defeat the fast path. Single-profile only — the aggregate
-    ``all_profiles`` branch ignores the flag and keeps its full loads.
+    touches the models-layer CLI cache: a stored fast list is a bounded window
+    the full builder must not serve, and a stored full list would defeat the
+    fast path. Single-profile only — the aggregate ``all_profiles`` branch
+    ignores the flag and keeps its full loads.
     """
     source_filter = _normalize_cli_session_source_filter(source_filter)
     if all_profiles:

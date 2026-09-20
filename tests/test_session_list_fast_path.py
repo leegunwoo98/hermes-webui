@@ -528,15 +528,18 @@ def test_fast_payload_keeps_untitled_cli_and_acp_rows_visible(monkeypatch, tmp_p
     assert {r["session_id"] for r in full["sessions"]} == ids
 
 
-def test_fast_payload_never_runs_claude_code_jsonl_scan(monkeypatch, tmp_path):
+def test_fast_payload_skips_claude_code_jsonl_scan_when_disabled(monkeypatch, tmp_path):
+    """With Claude Code sessions disabled the fast payload must not pay for the
+    JSONL scan (the shape does not ask for those rows) and no JSONL-backed row
+    may leak into it."""
     _install_fixture(monkeypatch, tmp_path)
 
     def _boom():
-        raise AssertionError("Claude Code JSONL scan must never run on the fast path")
+        raise AssertionError("Claude Code JSONL scan must not run when disabled")
 
     monkeypatch.setattr(models, "get_claude_code_sessions", _boom)
     monkeypatch.setattr(routes, "get_claude_code_sessions", _boom, raising=False)
-    fast = _build_fast()
+    fast = _build_fast(show_claude_code_sessions=False)
     ids = {r["session_id"] for r in fast["sessions"]}
     assert "claude-code-db-row" in ids  # state.db claude-code rows stay reachable
     assert not any(str(sid).startswith("claude_code_") for sid in ids)
@@ -629,40 +632,77 @@ def _jsonl_fixture_row():
         "is_cli_session": True,
         "read_only": True,
     }
+
+
+def test_fast_payload_parity_includes_claude_code_jsonl_rows(monkeypatch, tmp_path):
+    """With Claude Code sessions enabled, the JSONL-scan rows are part of the
+    session set for the default shape — the fast first paint must return them.
+
+    They exist only in the CLI list the JSONL scan produces (a JSONL-backed row
+    has no state.db row), so a fast builder that skips the scan omits valid
+    sessions from the first response while the full builder returns them for the
+    same request shape. Same setting, same session set.
+    """
+    _install_fixture(monkeypatch, tmp_path)
     monkeypatch.setattr(
-        models, "get_claude_code_sessions", lambda: [dict(jsonl_row)], raising=False,
+        models, "get_claude_code_sessions", lambda: [_jsonl_fixture_row()], raising=False,
     )
 
     full = _build_full()
     fast = _build_fast()
 
-    assert "claude_code_deadbeefdeadbeefdeadbeef" in {r["session_id"] for r in full["sessions"]}
-    assert "claude_code_deadbeefdeadbeefdeadbeef" not in {r["session_id"] for r in fast["sessions"]}
-    # The JSONL row adds exactly one to the full payload's CLI-for-settings
-    # count; the fast payload's count covers the bounded state.db window only.
-    assert full["cli_session_count"] == fast["cli_session_count"] + 1
-    assert fast["cli_session_count"] > 0  # the fixture's own CLI-classified rows
-    # Visible rows still match for the state.db-backed sessions.
-    full_ids = {r["session_id"] for r in full["sessions"] if not r["session_id"].startswith("claude_code_")}
-    fast_ids = {r["session_id"] for r in fast["sessions"]}
-    assert full_ids == fast_ids
+    _assert_payload_parity(full, fast)
+    assert "claude_code_deadbeefdeadbeefdeadbeef" in {r["session_id"] for r in fast["sessions"]}
 
 
-def test_fast_window_loader_never_runs_the_jsonl_scan_even_when_asked(monkeypatch, tmp_path):
-    """Defense in depth: ``include_claude_code=True`` must not re-enable the
-    unbounded JSONL walk on a fast window (the loader forces the skip)."""
+def test_fast_payload_counts_match_the_full_payload_when_claude_code_is_disabled(monkeypatch, tmp_path):
+    """With Claude Code sessions disabled, both builders exclude the JSONL
+    scan's rows from the CLI list and the count fields.
+
+    The count fields describe the CLI list for the request shape; a fast window
+    that ran the scan anyway (or a full builder that skipped it) would count
+    rows the shape did not ask for.
+    """
+    _install_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        models, "get_claude_code_sessions", lambda: [_jsonl_fixture_row()], raising=False,
+    )
+
+    full = _build_full(show_claude_code_sessions=False)
+    fast = _build_fast(show_claude_code_sessions=False)
+
+    _assert_payload_parity(full, fast)
+    assert not any(
+        str(r["session_id"]).startswith("claude_code_") for r in fast["sessions"]
+    )
+    assert fast["cli_session_count"] == full["cli_session_count"] > 0
+
+
+def test_fast_window_loader_honors_include_claude_code(monkeypatch, tmp_path):
+    """The fast window runs the same JSONL scan as any other load when the
+    caller asks for Claude Code sessions, and skips it when it does not.
+
+    A JSONL-backed row has no state.db row, so skipping the scan on the fast
+    window silently dropped valid sessions from the fast first paint while the
+    full builder returned them for the same request shape.
+    """
     _install_fixture(monkeypatch, tmp_path)
     calls = []
 
-    def _boom():
+    def _scan():
         calls.append("scan")
-        raise AssertionError("the JSONL scan must never run for fast_window=True")
+        return [_jsonl_fixture_row()]
 
-    monkeypatch.setattr(models, "get_claude_code_sessions", _boom, raising=False)
+    monkeypatch.setattr(models, "get_claude_code_sessions", _scan, raising=False)
     rows = models.get_cli_sessions(include_claude_code=True, fast_window=True)
-    assert calls == []
+    assert calls == ["scan"]
+    assert "claude_code_deadbeefdeadbeefdeadbeef" in {r["session_id"] for r in rows}
     assert rows  # the bounded state.db window still returns rows
-    assert not any(str(r.get("session_id", "")).startswith("claude_code_") for r in rows)
+
+    calls.clear()
+    rows_disabled = models.get_cli_sessions(include_claude_code=False, fast_window=True)
+    assert calls == []
+    assert not any(str(r.get("session_id", "")).startswith("claude_code_") for r in rows_disabled)
 
 
 def test_fast_reader_degrades_without_a_messages_table(monkeypatch, tmp_path):
