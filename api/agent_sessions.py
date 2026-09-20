@@ -877,6 +877,119 @@ def read_importable_agent_session_rows(
 
 FAST_SIDEBAR_CANDIDATE_OVERSAMPLE = 8
 
+# Depth of each candidate-union pre-window (``_fast_candidate_union_cte``), as a
+# multiple of the candidate window. The message-recency window is 8x deeper
+# again: message rows are far denser than session rows, so a same-depth window
+# covers only a handful of sessions on a busy store.
+FAST_SIDEBAR_PREWINDOW_OVERSAMPLE = 8
+
+
+def _fast_candidate_union_cte(
+    *,
+    where_sql: str,
+    where_params: list[object],
+    session_cols: set[str],
+    session_indexes: set[str],
+    candidate_order_clause: str,
+    candidate_limit: int,
+) -> tuple[str | None, list[object]]:
+    """Candidate CTE for the fast reader: bounded pre-window union + exact key.
+
+    SQLite evaluates a correlated ordering expression for every qualifying row
+    *before* ``LIMIT``, so ordering the window directly by the exact
+    ``COALESCE(MAX(messages.timestamp), started_at)`` key costs one indexed
+    message probe per qualifying session at any window size — the window bounds
+    the projection, not the key. Measured on fixture stores (warm median / cold
+    first run): 0.7 ms / 11 ms at 1k sessions, 9.9 ms / 102 ms at 10k, 54.9 ms /
+    556 ms at 50k, and 5.3 ms / 271 ms on a clone of the live ~3k-session
+    4.2 GB store — linear in the session count, and already past the fast
+    build's ~100 ms budget on the cold runs.
+
+    Bound the probe count instead: seed the candidate set with a bounded UNION
+    of index-ordered pre-windows (each ``LIMIT candidate_limit``, so the union
+    is at most ``3 * candidate_limit`` session rows plus the distinct sessions
+    of the newest ``candidate_limit * FAST_SIDEBAR_PREWINDOW_OVERSAMPLE``
+    message rows), then apply the exact key only over that union. The final
+    exact sort and the window membership rule are unchanged; only the row set
+    the key is evaluated over is bounded. Cost is bounded by the pre-window
+    depth at any store size (measured on the same stores: ~0.5-1.2 ms warm).
+
+    The pre-windows are seeds, not a guarantee: each is an ordering the exact
+    top-N tracks closely but need not contain. Empirically the exact top-N over
+    the union equals the exact top-N over all qualifying sessions (checked at
+    the 160-row window on the live-store clone and the 1k/10k/50k fixtures, and
+    pinned by the resumed-session regression tests in
+    ``tests/test_session_candidate_ordering_perf.py``); the residual bound is a
+    session whose only recency evidence (its latest message) lies outside all
+    four pre-windows. The guarantee and its bound are documented in
+    ``docs/architecture/session-list-fast-path.md``.
+
+    Returns ``(sql, params)``, or ``(None, [])`` when the store has none of the
+    agent's standard sessions indexes (``idx_sessions_effective_activity`` /
+    ``idx_sessions_started``) to seed the union with: the caller then keeps the
+    plain exact-key window — the pre-union behaviour — instead of paying a
+    whole-table sort per pre-window.
+    """
+    pre_windows: list[tuple[str, str]] = []
+    pre_params: list[object] = []
+
+    def _add_session_window(name: str, order_sql: str) -> None:
+        pre_windows.append((
+            name,
+            "SELECT s.id FROM sessions s\n"
+            f"                    WHERE {where_sql}\n"
+            f"                    ORDER BY {order_sql}\n"
+            "                    LIMIT ?",
+        ))
+        pre_params.extend([*where_params, candidate_limit])
+
+    # Session-row recency seeds. Each ordering is index-backed on the agent's
+    # standard schema, so the seed is a bounded index read, never a sort.
+    if 'last_activity_at' in session_cols and 'idx_sessions_effective_activity' in session_indexes:
+        _add_session_window(
+            "pre_activity", "COALESCE(s.last_activity_at, s.started_at) DESC, s.started_at DESC"
+        )
+    if 'idx_sessions_started' in session_indexes:
+        _add_session_window("pre_started", "s.started_at DESC")
+    if not pre_windows:
+        return None, []
+    # Insertion order; rowid is the sessions table's own b-tree, no index needed.
+    _add_session_window("pre_rowid", "s.rowid DESC")
+    # Message-recency seed: the sessions of the newest message rows, by
+    # insertion order (``messages.rowid``). This is the seed that covers a
+    # resumed session whose denormalized ``last_activity_at`` is NULL or stale
+    # while its messages are fresh.
+    pre_windows.append((
+        "pre_messages",
+        "SELECT DISTINCT m.session_id AS id FROM (\n"
+        "                        SELECT m.session_id FROM messages m\n"
+        "                        ORDER BY m.rowid DESC\n"
+        "                        LIMIT ?\n"
+        "                    ) m",
+    ))
+    pre_params.append(candidate_limit * FAST_SIDEBAR_PREWINDOW_OVERSAMPLE)
+
+    union_select = "\n                          UNION ".join(
+        f"SELECT id FROM {name}" for name, _body in pre_windows
+    )
+    ctes = ",\n".join(
+        f"                {name} AS (\n                    {body}\n                )"
+        for name, body in pre_windows
+    )
+    return (
+        "WITH " + ctes + ",\n"
+        "                candidates AS (\n"
+        "                    SELECT s.id FROM sessions s\n"
+        f"                    WHERE {where_sql}\n"
+        "                      AND s.id IN (\n"
+        f"                          {union_select}\n"
+        "                      )\n"
+        f"                    {candidate_order_clause}\n"
+        "                    LIMIT ?\n"
+        "                )",
+        [*pre_params, *where_params, candidate_limit],
+    )
+
 
 def _fill_fast_visibility_user_counts(cur, message_cols: set[str], rows: list[dict]) -> None:
     """Fill ``actual_user_message_count`` for rows the visibility filter dropped.
@@ -992,6 +1105,11 @@ def read_fast_sidebar_agent_rows(
         session_cols = {row[1] for row in cur.fetchall()}
         cur.execute("PRAGMA table_info(messages)")
         message_cols = {row[1] for row in cur.fetchall()}
+        # Index presence decides which pre-windows can seed the candidate union
+        # (``_fast_candidate_union_cte``): each seed must be an index-ordered
+        # bounded read, never a sort of the whole sessions table.
+        cur.execute("PRAGMA index_list(sessions)")
+        session_indexes = {str(row[1]) for row in cur.fetchall()}
         if 'source' not in session_cols:
             return []
 
@@ -1065,6 +1183,13 @@ def read_fast_sidebar_agent_rows(
             # Same exact candidate key as the full reader (and the same
             # guarantee): the window must be a prefix of the display order, not
             # an oversample of the lagging ``s.last_activity_at``.
+            #
+            # The key is evaluated per *qualifying* row before LIMIT, so the
+            # fast reader does not order the whole store by it: the candidate
+            # set is seeded with a bounded union of index-ordered pre-windows
+            # and the exact key is applied only over that union
+            # (``_fast_candidate_union_cte`` — the measured cost curve and the
+            # guarantee live there). The final exact sort is unchanged.
             candidate_order_clause = (
                 "ORDER BY COALESCE((SELECT MAX(mx.timestamp) FROM messages mx "
                 "WHERE mx.session_id = s.id), s.started_at) DESC, s.started_at DESC"
@@ -1075,15 +1200,31 @@ def read_fast_sidebar_agent_rows(
             candidate_order_clause = "ORDER BY s.started_at DESC"
 
         candidate_limit = max(result_limit * FAST_SIDEBAR_CANDIDATE_OVERSAMPLE, result_limit)
+        where_sql = " AND ".join(where_clauses)
+        candidates_cte = None
+        candidate_params: list[object] = [*params, candidate_limit]
+        if use_messages_join and messages_has_timestamp:
+            candidates_cte, candidate_params = _fast_candidate_union_cte(
+                where_sql=where_sql,
+                where_params=params,
+                session_cols=session_cols,
+                session_indexes=session_indexes,
+                candidate_order_clause=candidate_order_clause,
+                candidate_limit=candidate_limit,
+            )
+        if candidates_cte is None:
+            candidates_cte = (
+                "WITH candidates AS (\n"
+                "                SELECT s.id\n"
+                "                FROM sessions s\n"
+                f"                WHERE {where_sql}\n"
+                f"                {candidate_order_clause}\n"
+                "                LIMIT ?\n"
+                "            )"
+            )
         cur.execute(
             f"""
-            WITH candidates AS (
-                SELECT s.id
-                FROM sessions s
-                WHERE {' AND '.join(where_clauses)}
-                {candidate_order_clause}
-                LIMIT ?
-            )
+            {candidates_cte}
             SELECT s.id, s.title, s.model, s.message_count,
                    s.started_at, s.source,
                    {session_source_expr},
@@ -1107,7 +1248,7 @@ def read_fast_sidebar_agent_rows(
             {group_by_clause}
             {display_order_clause}
             """,
-            [*params, candidate_limit],
+            candidate_params,
         )
         projected = _project_agent_session_rows([dict(row) for row in cur.fetchall()])
         projected = [_with_normalized_source(row) for row in projected]

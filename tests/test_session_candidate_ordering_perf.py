@@ -588,3 +588,145 @@ def test_candidate_window_is_complete_for_resumed_rows_beyond_the_oversample(tmp
     assert full_ids[0] == "resumed-old"
 
 
+# ---------------------------------------------------------------------------
+# The fast reader's candidate set: a bounded UNION of index-ordered pre-windows
+# (``_fast_candidate_union_cte``). SQLite evaluates the exact ordering key per
+# *qualifying* row before LIMIT, so ordering the window directly by it costs one
+# indexed message probe per session at any window size (measured on fixture
+# stores, warm medians: 0.7 ms at 1k sessions, 9.9 ms at 10k, 54.9 ms at 50k,
+# 5.3 ms on a clone of the live ~3k-session store; the fast build's whole
+# budget is ~100 ms). The union bounds the probe count to the pre-window depth
+# at any store size; the final exact sort is unchanged. The regression that
+# matters: a resumed row whose session-row keys are all stale must still be
+# seeded — by the message-recency pre-window.
+# ---------------------------------------------------------------------------
+
+RESUMED_BASE = 1_700_000_000.0
+
+
+def _build_resumed_first_db(path: Path, fillers: int = 200) -> None:
+    """Resumed-old row FIRST — lowest rowid, oldest ``started_at``, NULL
+    ``last_activity_at`` — with its messages appended LAST (newest message
+    rowids and timestamps): only the message-recency pre-window can see it.
+
+    Every session-row key ranks it outside the 160-row pre-windows: the
+    activity key falls back to the old ``started_at``, and both ``started_at``
+    and ``rowid`` order it behind all ``fillers`` newer rows.
+    """
+    if path.exists():
+        path.unlink()
+    conn = sqlite3.connect(str(path))
+    conn.executescript(_SCHEMA)
+    conn.execute(
+        "INSERT INTO sessions (id, source, session_source, title, model, started_at,"
+        " message_count, parent_session_id, ended_at, end_reason, last_activity_at)"
+        " VALUES ('resumed-old', 'desktop', 'desktop', 'Resumed old', 'test-model', ?, 2,"
+        " NULL, NULL, NULL, NULL)",
+        (RESUMED_BASE + 10,),
+    )
+    for i in range(fillers):
+        started = RESUMED_BASE + 1000 + i
+        conn.execute(
+            "INSERT INTO sessions (id, source, session_source, title, model, started_at,"
+            " message_count, parent_session_id, ended_at, end_reason, last_activity_at)"
+            " VALUES (?, 'desktop', 'desktop', ?, 'test-model', ?, 1, NULL, NULL, NULL, ?)",
+            (f"filler-{i:03d}", f"title filler-{i:03d}", started, started + 5),
+        )
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?,?,?,?,?)",
+            (f"msg-filler-{i:03d}", f"filler-{i:03d}", "user", "hi", started),
+        )
+    for index, timestamp in enumerate((RESUMED_BASE + 5000, RESUMED_BASE + 5001)):
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?,?,?,?,?)",
+            (f"msg-resumed-{index}", "resumed-old",
+             "user" if index == 0 else "assistant", "hi", timestamp),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_candidate_union_keeps_a_resumed_row_visible_only_through_message_recency(tmp_path):
+    """A resumed row whose only recency evidence is its messages must survive
+    the fast reader's bounded candidate union.
+
+    Fixture (``_build_resumed_first_db``): the resumed row is the oldest by
+    every session-row key — lowest rowid, oldest ``started_at``, NULL
+    ``last_activity_at`` — while its messages are the newest in the store. All
+    three session-row pre-windows miss it; the message-recency pre-window
+    (sessions of the newest ``candidate_limit * 8`` message rows) carries it
+    into the union, where the exact key ranks it first. Without that seed the
+    fast payload would drop a row the full reader returns (parity break).
+    """
+    db = tmp_path / "state.db"
+    _build_resumed_first_db(db)
+    conn = sqlite3.connect(str(db))
+    try:
+        # Fixture sanity: the session-row pre-windows genuinely miss the row...
+        for order in (CANDIDATE_ORDER, "s.started_at DESC", "s.rowid DESC"):
+            assert "resumed-old" not in _top_ids(conn, order, 160), order
+        # ... and only the message-recency seed (insertion order) sees it.
+        message_seed = [
+            str(row[0]) for row in conn.execute(
+                "SELECT DISTINCT m.session_id FROM (SELECT m.session_id FROM messages m"
+                " ORDER BY m.rowid DESC LIMIT 1280) m"
+            )
+        ]
+        assert "resumed-old" in message_seed
+        exact_top20 = _top_ids(conn, EXACT_ORDER, 20)
+    finally:
+        conn.close()
+    assert exact_top20[0] == "resumed-old"
+
+    fast_ids = [str(row["id"]) for row in _fast_interactive_rows(db, limit=20)]
+    full_ids = [str(row["id"]) for row in _interactive_rows(db, limit=20)]
+    assert fast_ids == full_ids
+    assert fast_ids[0] == "resumed-old"
+
+
+def test_fast_candidate_union_is_bounded_and_seeded_by_pre_windows(monkeypatch, tmp_path):
+    """The fast reader's candidate set is the bounded UNION of index-ordered
+    pre-windows, and the exact key is applied only over that union.
+
+    Pins the mechanism (not just the exact-key text): the pre-window LIMITs are
+    the candidate window (160), the message-recency window is 8x that (1280),
+    the candidates CTE intersects the union, and the correlated probe still
+    resolves through ``idx_messages_session``.
+    """
+    db = tmp_path / "state.db"
+    _build_state_db(db)
+
+    executed = []
+    _record_connect(monkeypatch, executed)
+    rows = _fast_interactive_rows(db, limit=20)
+    assert rows
+
+    candidate_calls = [(sql, params) for sql, params in executed if "candidates AS (" in sql]
+    assert candidate_calls, "expected the fast candidate-window SQL"
+    sql, params = candidate_calls[-1]
+    normalized = " ".join(sql.split())
+
+    for name in ("pre_activity", "pre_rowid", "pre_messages"):
+        assert f"{name} AS" in normalized, normalized[:400]
+    assert "s.id IN (" in normalized
+    assert "UNION SELECT id FROM pre_messages" in normalized
+    assert (
+        "ORDER BY COALESCE((SELECT MAX(mx.timestamp) FROM messages mx"
+        " WHERE mx.session_id = s.id), s.started_at) DESC, s.started_at DESC"
+    ) in normalized
+    # Bounded: pre-window LIMITs = the candidate window, message window = 8x.
+    limits = [value for value in params if isinstance(value, int)]
+    assert limits == [160, 160, 1280, 160], limits
+    assert agent_sessions.FAST_SIDEBAR_PREWINDOW_OVERSAMPLE == 8
+
+    # The correlated exact-key probe is index-backed (no whole-store messages
+    # aggregate), and the candidates CTE is driven by the union subquery.
+    conn = sqlite3.connect(str(db))
+    try:
+        plan = [str(row[-1]) for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)]
+    finally:
+        conn.close()
+    assert any("idx_messages_session" in line for line in plan), plan
+    assert any("UNION" in line or "MERGE" in line for line in plan), plan
+
+

@@ -600,13 +600,21 @@ def test_fast_payload_window_keeps_exact_counts_and_skips_user_turn_aggregation(
     for sql in fast_sql:
         assert "LOWER(m.role)" not in sql, f"fast window must not aggregate user turns: {sql[:200]}"
         assert "COUNT(CASE" not in sql
-        # The window is a prefix of the display order: exact key, never the
-        # lagging denormalized column.
+        # The window is a prefix of the display order: the candidates CTE's
+        # membership/order is the exact key, applied only over the bounded
+        # pre-window union.
         assert (
             "COALESCE((SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),"
             " s.started_at) DESC" in sql
         ), f"candidate window must order by the exact activity key: {sql[:200]}"
-        assert "COALESCE(s.last_activity_at" not in sql, (
+        assert "pre_activity AS" in sql and "s.id IN (" in sql, (
+            f"the candidate set must be seeded by the bounded pre-window union: {sql[:200]}"
+        )
+        # The lagging denormalized column may seed ``pre_activity`` (a bounded
+        # superset), but the candidates CTE — membership and order — must never
+        # reference it.
+        candidates_body = sql.split("candidates AS (", 1)[-1]
+        assert "COALESCE(s.last_activity_at" not in candidates_body, (
             f"the lagging denormalized key must not decide window membership: {sql[:200]}"
         )
     assert any("COUNT(m.id) AS actual_message_count" in s for s in fast_sql), (
