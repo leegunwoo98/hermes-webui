@@ -217,6 +217,7 @@ def _run_cold_start_warmup() -> dict:
     }
 
     t0 = time.monotonic()
+    result: dict = {}
     try:
         from api.routes import warm_default_session_list_cache
 
@@ -226,26 +227,39 @@ def _run_cold_start_warmup() -> dict:
         error = result.get('error')
         if error:
             status = f'failed ({error})'
-        elif not result.get('owner'):
-            status = 'already-claimed'
-        elif not result.get('completed'):
-            status = 'timeout'
         else:
-            status = 'ok'
+            # The routes-side warm-up derives this from the cache itself: a
+            # signaled claim event alone (builder exception, exhausted
+            # invalidation retries, worker-start failure) is NOT success, so
+            # 'ok' here means the slot really holds a fresh cache entry.
+            status = str(result.get('status') or 'unknown')
     except Exception as exc:
         status = f'failed ({type(exc).__name__}: {exc})'
     stats['session_list'] = {
         'status': status,
         'elapsed_ms': int((time.monotonic() - t0) * 1000),
+        'profiles': result.get('profiles') or [],
+        'profiles_warmed': result.get('profiles_warmed') or 0,
+        'profiles_considered': result.get('profiles_considered') or 0,
+        'profiles_known': result.get('profiles_known') or 0,
+        'capped': bool(result.get('capped')),
     }
 
     stats['total_ms'] = int((time.monotonic() - started) * 1000)
+    session_list = stats['session_list']
+    session_detail = f"{session_list['status']} {session_list['elapsed_ms']} ms"
+    if session_list['profiles_considered']:
+        session_detail += (
+            f" profiles={session_list['profiles_warmed']}"
+            f"/{session_list['profiles_considered']}"
+        )
+        if session_list['capped']:
+            session_detail += f" (capped of {session_list['profiles_known']} known)"
     print(
         f"[warmup] cold-start warm-up finished in {stats['total_ms']} ms "
         f"(models_provenance={stats['models_provenance']['status']} "
         f"{stats['models_provenance']['elapsed_ms']} ms; "
-        f"session_list={stats['session_list']['status']} "
-        f"{stats['session_list']['elapsed_ms']} ms)",
+        f"session_list={session_detail})",
         flush=True,
     )
     return stats

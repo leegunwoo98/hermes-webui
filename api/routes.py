@@ -3065,6 +3065,26 @@ def _warmup_profile_names() -> tuple[list[str], int]:
     return names[:_WARMUP_MAX_PROFILES], len(names)
 
 
+def _warmup_key_has_fresh_entry(profile: str, key: tuple) -> bool:
+    """Route-freshness check for ``key`` under ``profile``'s request context.
+
+    Uses the cache's own helper — the same ``allow_stale=False`` lookup the route
+    performs after waiting on a claim — so "fresh" here means exactly what it
+    means on the request path. The source stamp is profile-resolved
+    (``_active_state_db_path`` → ``get_active_hermes_home``), so the check must
+    run with the profile's thread-local context, otherwise a non-default slot
+    always looks stale.
+    """
+    from api.profiles import clear_request_profile, set_request_profile
+
+    set_request_profile(profile)
+    try:
+        _payload, fresh = _session_list_cache_get(key, allow_stale=False)
+        return bool(fresh)
+    finally:
+        clear_request_profile()
+
+
 def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
     """Claim and drive background rebuilds for the sidebar's default shape.
 
@@ -3077,12 +3097,26 @@ def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
     would fill a slot a non-default browser never reads, so every profile the
     registry reports is warmed (bounded to ``_WARMUP_MAX_PROFILES``, process
     default first; ``profiles_known`` carries the pre-cap count so the caller
-    can log the cap).
+    can log the cap). Each rebuild runs under its profile's thread-local context
+    (``_start_session_list_cache_background_rebuild(profile=...)``) so both the
+    payload and the profile-resolved source stamp match what a cookie request
+    will compute.
 
     Each rebuild goes through the registered claim event
     (``_session_list_cache_claim_rebuild`` → ``_start_session_list_cache_background_rebuild``)
     so any concurrent waiter is released by the normal ``_session_list_cache_done``
-    path; an already-owned key is left to its owner.
+    path; an already-owned key is left to its owner (``skipped``).
+
+    ``completed`` only means the claim event was signaled — builder exceptions,
+    exhausted invalidation retries and worker-start failures all signal it. The
+    reported outcome therefore comes from the cache itself: after the rebuild
+    settles, the key must hold a FRESH entry by the route's own freshness notion
+    (``_warmup_key_has_fresh_entry``). Per profile: ``ok`` (fresh entry landed),
+    ``failed`` (event signaled, no fresh entry), ``timeout`` (event never
+    signaled in the wait budget) or ``skipped`` (another rebuild owns the key).
+    The overall ``status`` is ``failed`` if any profile failed, else ``timeout``,
+    else ``ok`` if at least one landed, else ``skipped``; ``profiles_warmed``
+    counts the ``ok`` slots.
 
     Never raises: the returned stats dict carries the outcome for logging. The
     builder writes what the request path already writes (the session index /
@@ -3093,8 +3127,10 @@ def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
         "owner": False,
         "completed": False,
         "key": None,
+        "status": "skipped",
         "profiles": [],
         "profiles_considered": 0,
+        "profiles_warmed": 0,
         "profiles_known": 0,
         "capped": False,
         "elapsed_ms": 0,
@@ -3122,6 +3158,8 @@ def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
                 "key": key,
                 "owner": bool(is_owner),
                 "completed": False,
+                "fresh": False,
+                "status": "pending",
             }
             entries.append(entry)
             if is_owner:
@@ -3133,12 +3171,30 @@ def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
                 )
             claims.append((entry, event))
         for entry, event in claims:
-            if entry["owner"]:
+            if not entry["owner"]:
+                entry["status"] = "skipped"
+                continue
+            if not entry["completed"]:
                 entry["completed"] = bool(
                     event.wait(max(0.0, deadline - time.monotonic()))
                 )
+            if not entry["completed"]:
+                entry["status"] = "timeout"
+                continue
+            entry["fresh"] = _warmup_key_has_fresh_entry(entry["profile"], entry["key"])
+            entry["status"] = "ok" if entry["fresh"] else "failed"
         stats["profiles"] = entries
         stats["profiles_considered"] = len(entries)
+        stats["profiles_warmed"] = sum(
+            1 for entry in entries if entry["status"] == "ok"
+        )
+        statuses = {entry["status"] for entry in entries}
+        if "failed" in statuses:
+            stats["status"] = "failed"
+        elif "timeout" in statuses:
+            stats["status"] = "timeout"
+        elif "ok" in statuses:
+            stats["status"] = "ok"
         owned = [entry for entry in entries if entry["owner"]]
         stats["owner"] = bool(owned)
         stats["completed"] = bool(owned) and all(entry["completed"] for entry in owned)
@@ -3146,6 +3202,7 @@ def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
             stats["key"] = entries[0]["key"]
     except Exception as exc:
         stats["error"] = f"{type(exc).__name__}: {exc}"
+        stats["status"] = "error"
     stats["elapsed_ms"] = int((time.monotonic() - started) * 1000)
     return stats
 

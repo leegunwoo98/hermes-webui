@@ -225,6 +225,9 @@ def test_warmup_fills_the_slot_the_route_reads(monkeypatch):
     stats = routes.warm_default_session_list_cache(wait_timeout=10.0)
     assert stats["owner"] is True
     assert stats["completed"] is True
+    assert stats["status"] == "ok", "a fresh entry landed: the warm-up must report ok"
+    assert stats["profiles"][0]["fresh"] is True
+    assert stats["profiles"][0]["status"] == "ok"
     assert stats["key"] == _route_key_for_query("sidebar_source=webui&exclude_hidden=1")
     assert calls["all_sessions"] >= 1, "warm-up must drive the real builder once"
     warmed_calls = calls["all_sessions"]
@@ -353,6 +356,10 @@ def test_warmup_respects_an_existing_claim_without_a_home_made_event(monkeypatch
     try:
         stats = routes.warm_default_session_list_cache(wait_timeout=0.05)
         assert stats["owner"] is False, "an already-owned key must not be re-claimed"
+        assert stats["status"] == "skipped", (
+            "a key owned by another rebuild is neither ok nor failed — it was skipped"
+        )
+        assert stats["profiles"][0]["status"] == "skipped"
         assert started == [], "no second rebuild may be started for an owned key"
         assert routes._SESSIONS_CACHE_INFLIGHT.get(key) is event, (
             "the warm-up must not replace or drop the registered claim event"
@@ -393,6 +400,12 @@ def test_warmup_builder_failure_does_not_raise_and_releases_the_claim(monkeypatc
     stats = routes.warm_default_session_list_cache(wait_timeout=10.0)
     assert stats["error"] is None
     assert stats["completed"] is True, "the rebuild's finally must still complete the event"
+    # ...but a signaled event is NOT success: the slot must hold a fresh entry.
+    assert stats["status"] == "failed", (
+        "a failed rebuild must not be reported as ok — the first request is still cold"
+    )
+    assert stats["profiles"][0]["fresh"] is False
+    assert stats["profiles"][0]["status"] == "failed"
     with routes._SESSIONS_CACHE_LOCK:
         assert stats["key"] not in routes._SESSIONS_CACHE_INFLIGHT
 
@@ -414,9 +427,61 @@ def test_warmup_plan_failure_does_not_raise_and_claims_nothing(monkeypatch):
 def _stub_session_warm(monkeypatch, status="ok"):
     monkeypatch.setattr(
         routes, "warm_default_session_list_cache",
-        lambda **_kw: {"owner": True, "completed": status == "ok",
-                       "elapsed_ms": 1, "error": None, "key": None},
+        lambda **_kw: {"owner": True, "completed": status == "ok", "status": status,
+                       "elapsed_ms": 1, "error": None, "key": None,
+                       "profiles": [], "profiles_warmed": 1, "profiles_considered": 1,
+                       "profiles_known": 1, "capped": False},
     )
+
+
+def _stub_models_warm(monkeypatch):
+    monkeypatch.setattr(config, "warm_models_catalog_provenance_if_cold", lambda: None)
+
+
+def test_cold_start_warmup_logs_ok_only_when_a_fresh_entry_landed(monkeypatch, capsys):
+    """The [warmup] line must reflect the cache outcome, not just the event."""
+    _install_route_stubs(monkeypatch)
+    _stub_models_warm(monkeypatch)
+
+    stats = startup._run_cold_start_warmup()
+    out = capsys.readouterr().out
+    assert stats["session_list"]["status"] == "ok"
+    assert "session_list=ok" in out
+    assert "profiles=1/1" in out
+
+
+def test_cold_start_warmup_logs_failed_when_no_fresh_entry_landed(monkeypatch, capsys):
+    """A builder exception still signals the claim event; the log must not say ok."""
+    _install_route_stubs(monkeypatch)
+    _stub_models_warm(monkeypatch)
+    monkeypatch.setattr(
+        routes, "_build_session_list_cache_payload",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("builder exploded")),
+    )
+
+    stats = startup._run_cold_start_warmup()
+    out = capsys.readouterr().out
+    assert stats["session_list"]["status"] == "failed"
+    assert "session_list=failed" in out
+    assert "session_list=ok" not in out
+
+
+def test_cold_start_warmup_logs_the_profile_cap(monkeypatch, capsys):
+    _install_route_stubs(monkeypatch)
+    _stub_models_warm(monkeypatch)
+    monkeypatch.setattr(
+        routes, "warm_default_session_list_cache",
+        lambda **_kw: {"owner": True, "completed": True, "status": "ok",
+                       "elapsed_ms": 1, "error": None, "key": None,
+                       "profiles": [], "profiles_warmed": 4, "profiles_considered": 4,
+                       "profiles_known": 9, "capped": True},
+    )
+
+    stats = startup._run_cold_start_warmup()
+    out = capsys.readouterr().out
+    assert stats["session_list"]["status"] == "ok"
+    assert "profiles=4/4" in out
+    assert "capped of 9 known" in out
 
 
 def test_cold_start_warmup_warms_models_provenance_from_disk_once(monkeypatch):
