@@ -1962,6 +1962,7 @@ _session_list_cache_claim_rebuild = _route_session_list_cache._session_list_cach
 _session_list_cache_done = _route_session_list_cache._session_list_cache_done
 _session_list_cache_get = _route_session_list_cache._session_list_cache_get
 _session_list_cache_invalidation_stamp = _route_session_list_cache._session_list_cache_invalidation_stamp
+_session_list_cache_key_profile = _route_session_list_cache._session_list_cache_key_profile
 _route_session_list_cache_key = _route_session_list_cache._session_list_cache_key
 _session_list_cache_overlay_runtime_rows = _route_session_list_cache._session_list_cache_overlay_runtime_rows
 _session_list_cache_path_stamp = _route_session_list_cache._session_list_cache_path_stamp
@@ -2927,7 +2928,16 @@ def _get_cached_session_list_payload(
                     diag.stage("session_list_cache_stale_background_rebuild")
                 except Exception:
                     pass
-            _start_session_list_cache_background_rebuild(key, event, builder)
+            # Rebuild under the profile the key belongs to: this thread carries no
+            # request context, so without it a non-default profile's key would be
+            # rebuilt (and stamped) against the process default's home and the
+            # entry would be invalidated on the first request that reads it.
+            _start_session_list_cache_background_rebuild(
+                key,
+                event,
+                builder,
+                profile=_session_list_cache_key_profile(key),
+            )
         elif diag is not None:
             try:
                 diag.stage("session_list_cache_stale_return")

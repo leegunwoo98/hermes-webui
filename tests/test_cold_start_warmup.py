@@ -389,6 +389,104 @@ def test_warmup_completes_the_claimed_event_and_releases_the_claim(monkeypatch):
         )
 
 
+# ── the route's own stale-path background rebuild (B-R1) ─────────────────────
+
+def _wait_for_claim_release(key, timeout: float = 10.0) -> bool:
+    """Wait until no rebuild claim is registered for ``key``."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with routes._SESSIONS_CACHE_LOCK:
+            if key not in routes._SESSIONS_CACHE_INFLIGHT:
+                return True
+        time.sleep(0.01)
+    return False
+
+
+def test_stale_route_rebuild_stores_under_the_key_profile(monkeypatch):
+    """The route's stale-path background rebuild must run the WHOLE rebuild under
+    the profile the cache key names (``key[0]``).
+
+    Otherwise the rebuild — a non-default profile's key — reads and stamps the
+    process default's home, so the entry it stores is ``source``-stale for the
+    profile that key belongs to and the slot is thrown away on first read: the
+    rebuild is wasted and the request that triggered it still pays a full build.
+    Asserts the stored stamp / resolved home, not the helper's kwarg.
+    """
+    _install_route_stubs(monkeypatch)
+    cache = routes._route_session_list_cache
+    real_build = routes._build_session_list_cache_payload
+    seen: list[dict] = []
+
+    def _recording_build(**kwargs):
+        seen.append({
+            "profile": profiles.get_active_profile_name(),
+            "home": str(profiles.get_active_hermes_home()),
+        })
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(routes, "_build_session_list_cache_payload", _recording_build)
+
+    # The key a request carrying the alpha cookie builds, plus the alpha-resolved
+    # source stamp — the stamp that request will compare the entry against.
+    alpha_key, alpha_kwargs = routes._session_list_cache_request_plan(
+        dict(_DEFAULT_SETTINGS), active_profile="alpha",
+        **routes._DEFAULT_SIDEBAR_REQUEST_SHAPE,
+    )
+    assert alpha_key[0] == "alpha", "precondition: the key's first element is the profile"
+
+    profiles.set_request_profile("alpha")
+    try:
+        alpha_stamp = routes._session_list_cache_source_stamp(alpha_key)
+        alpha_home = str(profiles.get_active_hermes_home())
+        routes._session_list_cache_set(
+            alpha_key, {"sessions": []},
+            expected_invalidation_stamp=routes._session_list_cache_invalidation_stamp(alpha_key),
+        )
+    finally:
+        profiles.clear_request_profile()
+
+    # The default context stamps this same key differently — that is the stamp the
+    # pre-fix rebuild stored (and why the slot was invalidated on first read).
+    default_stamp = routes._session_list_cache_source_stamp(alpha_key)
+    assert default_stamp != alpha_stamp, (
+        "precondition: the profile-resolved source stamp must differ from the "
+        "process default's for this assertion to mean anything"
+    )
+
+    # Expire the TTL only: the entry stays stamp-fresh, so the route takes its
+    # stale-serve path (serve stale + rebuild in the background). Everything below
+    # runs under the alpha thread-local, exactly like a request carrying the
+    # hermes_profile cookie.
+    monkeypatch.setattr(cache, "_SESSIONS_CACHE_TTL_SECONDS", 0.0)
+
+    profiles.set_request_profile("alpha")
+    try:
+        assert routes._session_list_cache_stale_reason(alpha_key) == "age"
+        stale = routes._get_cached_session_list_payload(
+            key=alpha_key,
+            builder=lambda: routes._build_session_list_cache_payload(**alpha_kwargs),
+        )
+        assert stale == {"sessions": []}, "the stale payload is served while the rebuild runs"
+        assert _wait_for_claim_release(alpha_key), "the background rebuild never released its claim"
+        with routes._SESSIONS_CACHE_LOCK:
+            _ts, stored_stamp, _payload = routes._SESSIONS_CACHE.get(alpha_key, (None, None, None))
+        monkeypatch.setattr(cache, "_SESSIONS_CACHE_TTL_SECONDS", 2.5)
+        payload, fresh = routes._session_list_cache_get(alpha_key, allow_stale=False)
+    finally:
+        profiles.clear_request_profile()
+
+    assert seen == [{"profile": "alpha", "home": alpha_home}], (
+        "the stale-path rebuild ran outside the key's profile context"
+    )
+    assert stored_stamp == alpha_stamp and stored_stamp != default_stamp, (
+        "the rebuilt entry was stamped with the process default's home — the "
+        "alpha slot is source-stale and the rebuild is wasted"
+    )
+    assert fresh is True and payload is not None, (
+        "the rebuilt entry must be fresh for the profile that key belongs to"
+    )
+
+
 # ── failure containment ──────────────────────────────────────────────────────
 
 def test_warmup_builder_failure_does_not_raise_and_releases_the_claim(monkeypatch):
