@@ -4,8 +4,11 @@ The fast payload (``api.routes._build_session_list_fast_payload``) is the cold
 first-paint path for the default sidebar request shape. It must render the same
 visible list as the full builder (``_build_session_list_cache_payload``) for the
 same args, while never paying the unbounded pipeline costs: no messages JOIN
-aggregates over the whole candidate window, no Claude Code JSONL scan, no
-orphan-prune probes.
+aggregates over the whole candidate window, no orphan-prune probes. The Claude
+Code JSONL scan IS run whenever the request shape enables those sessions
+(bounded at ``CLAUDE_CODE_MAX_FILES``, per-file parse cache): a JSONL-backed row
+has no state.db row, so skipping it would drop valid sessions from the first
+paint while the full builder returns them for the same shape.
 
 Parity scope (plan v2 acceptance criterion 3): ids/order/title/updated_at/
 message_count/source flags/project_id/pinned/archived/relationship_type/
@@ -1128,31 +1131,34 @@ def test_fast_shape_gate(overrides, eligible):
     assert routes._session_list_fast_shape_eligible(**args) is eligible
 
 
+class _GetHandler:
+    """Minimal GET-handler double for ``/api/sessions`` route tests."""
+
+    def __init__(self, path):
+        self.path = path
+        self.headers = {}
+        self.client_address = ("127.0.0.1", 12345)
+        self.status = None
+        from io import BytesIO
+
+        self.wfile = BytesIO()
+
+    def send_response(self, status):
+        self.status = status
+
+    def send_header(self, key, value):
+        pass
+
+    def end_headers(self):
+        pass
+
+    @property
+    def response_json(self):
+        return json.loads(self.wfile.getvalue().decode("utf-8"))
+
+
 def test_sessions_route_serves_fast_payload_only_for_default_shape(monkeypatch, tmp_path):
     from urllib.parse import urlparse
-
-    class _GetHandler:
-        def __init__(self, path):
-            self.path = path
-            self.headers = {}
-            self.client_address = ("127.0.0.1", 12345)
-            self.status = None
-            from io import BytesIO
-
-            self.wfile = BytesIO()
-
-        def send_response(self, status):
-            self.status = status
-
-        def send_header(self, key, value):
-            pass
-
-        def end_headers(self):
-            pass
-
-        @property
-        def response_json(self):
-            return json.loads(self.wfile.getvalue().decode("utf-8"))
 
     _install_fixture(monkeypatch, tmp_path)
     monkeypatch.setattr(routes, "load_settings", lambda: json.loads(
@@ -1179,3 +1185,36 @@ def test_sessions_route_serves_fast_payload_only_for_default_shape(monkeypatch, 
     assert archive.status == 200
     assert [r["session_id"] for r in archive.response_json["sessions"]] != ["fast"]
     assert len(fast_calls) == 1, "archive/paged shapes must keep the full builder"
+
+
+def test_cold_route_with_claude_code_enabled_returns_the_full_builder_rows(monkeypatch, tmp_path):
+    """Cold first paint, Claude Code sessions enabled: the served rows ARE the
+    full builder's rows for the same shape.
+
+    JSONL-backed rows exist only in the scan's output (a JSONL-backed session has
+    no state.db row), so a fast builder that skipped the scan served a short
+    first response — valid sessions missing until the background rebuild landed,
+    and missing for good if the client never refetched. The route-level contract
+    is the reviewer's: same shape, same session set, scan included.
+    """
+    from urllib.parse import urlparse
+
+    _install_fixture(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        models, "get_claude_code_sessions", lambda: [_jsonl_fixture_row()], raising=False,
+    )
+    monkeypatch.setattr(routes, "load_settings", lambda: json.loads(
+        (tmp_path / "webui" / "settings.json").read_text(encoding="utf-8")
+    ))
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
+
+    handler = _GetHandler("/api/sessions?exclude_hidden=1")
+    routes.handle_get(handler, urlparse(handler.path))
+
+    assert handler.status == 200
+    served = [r["session_id"] for r in handler.response_json["sessions"]]
+    assert "claude_code_deadbeefdeadbeefdeadbeef" in served, (
+        "the cold first paint must include the JSONL-backed Claude Code session"
+    )
+    full = _build_full(exclude_hidden=True)
+    assert served == [r["session_id"] for r in full["sessions"]]

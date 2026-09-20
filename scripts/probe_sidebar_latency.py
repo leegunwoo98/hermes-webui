@@ -287,8 +287,9 @@ def _fast_sidebar_section(runs: int) -> int:
         if fast_payload.get(field) != full_payload.get(field):
             note = ""
             if field in ("cli_count", "cli_session_count"):
-                note = (" [expected: the full payload counts the Claude Code JSONL scan's "
-                        "rows, which the fast path never produces]")
+                note = (" [BUG if nonzero: the fast payload runs the same Claude Code JSONL "
+                        "scan as the full builder for the same shape, so these counts must "
+                        "agree]")
             print(f"  parity count divergence {field}: fast={fast_payload.get(field)} "
                   f"full={full_payload.get(field)}{note}")
     diffs = 0
@@ -364,10 +365,13 @@ def main() -> int:
     # 0) Interactive pass (the sidebar's visible CLI/agent window). Measured
     # FIRST in the process so sample 1 is the process's first state.db DATA read
     # (cold); later samples are warm. (The probe's own PRAGMA guard and the
-    # pass's schema PRAGMAs have already touched the file.) Pre-Slice-D this
-    # pass ordered its candidate window with a correlated per-row
-    # MAX(messages.timestamp) subquery; after the swap it uses the indexed
-    # COALESCE(s.last_activity_at, s.started_at) key.
+    # pass's schema PRAGMAs have already touched the file.) The pass orders its
+    # candidate window by the exact per-row MAX(messages.timestamp) subquery —
+    # the same key the display sorts by, resolved per session through
+    # ``idx_messages_session``. (A Slice-D interim ordered it by the indexed
+    # ``COALESCE(s.last_activity_at, s.started_at)`` column; that column lags
+    # the exact key by an unbounded amount, so an oversample of it is headroom,
+    # not a membership bound — see the review fix on this PR.)
     def interactive_pass():
         return models.read_importable_agent_session_rows(
             db_path,
