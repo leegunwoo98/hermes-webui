@@ -1,6 +1,6 @@
 """Hermes Web UI -- startup helpers."""
 from __future__ import annotations
-import os, stat, subprocess, sys
+import os, stat, subprocess, sys, threading, time
 from pathlib import Path
 
 # Credential files that should never be world-readable
@@ -11,6 +11,16 @@ _SENSITIVE_FILES = (
     '.signing_key',
     'auth.json',
 )
+
+# Cold-start warm-up (post-bind, best-effort). Disable with
+# HERMES_WEBUI_NO_WARMUP=1 (e.g. profiling, debugging a cold-path bug).
+_WARMUP_DISABLE_ENV = 'HERMES_WEBUI_NO_WARMUP'
+# Upper bound the warm thread waits for the session-list rebuild before it logs
+# and gives up. It never blocks readiness (daemon thread) and the claim stays
+# with the background rebuild either way, so waiters are still released.
+_WARMUP_SESSION_WAIT_SECONDS = 30.0
+_warmup_lock = threading.Lock()
+_warmup_started = False
 
 
 def fix_credential_permissions() -> None:
@@ -126,3 +136,75 @@ def auto_install_agent_deps() -> bool:
     except Exception as e:
         print(f'[!!] Auto-install error: {e}', flush=True)
         return False
+
+
+def _warmup_disabled() -> bool:
+    return os.environ.get(_WARMUP_DISABLE_ENV, '').strip().lower() in ('1', 'true', 'yes')
+
+
+def start_cold_start_warmup():
+    """Start the bounded post-bind cold-start warm-up thread (best-effort).
+
+    Called once right after the HTTP server has bound, so it can never delay
+    readiness. Returns the started thread, or None when disabled
+    (``HERMES_WEBUI_NO_WARMUP=1``) or already started this process. The thread is
+    a daemon and every failure inside it is logged, never raised.
+    """
+    global _warmup_started
+    if _warmup_disabled():
+        return None
+    with _warmup_lock:
+        if _warmup_started:
+            return None
+        _warmup_started = True
+    thread = threading.Thread(
+        target=_run_cold_start_warmup,
+        name='webui-cold-start-warmup',
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _run_cold_start_warmup() -> dict:
+    """Warm the first-paint caches once; returns per-component stats.
+
+    Never raises. Session list: claims the real default-shape cache key and
+    drives the same builder the route uses, as a background rebuild — the
+    builder writes what the request path already writes (the session index /
+    sidecars), not state.db.
+    """
+    started = time.monotonic()
+    stats: dict = {}
+
+    t0 = time.monotonic()
+    try:
+        from api.routes import warm_default_session_list_cache
+
+        result = warm_default_session_list_cache(
+            wait_timeout=_WARMUP_SESSION_WAIT_SECONDS
+        )
+        error = result.get('error')
+        if error:
+            status = f'failed ({error})'
+        elif not result.get('owner'):
+            status = 'already-claimed'
+        elif not result.get('completed'):
+            status = 'timeout'
+        else:
+            status = 'ok'
+    except Exception as exc:
+        status = f'failed ({type(exc).__name__}: {exc})'
+    stats['session_list'] = {
+        'status': status,
+        'elapsed_ms': int((time.monotonic() - t0) * 1000),
+    }
+
+    stats['total_ms'] = int((time.monotonic() - started) * 1000)
+    print(
+        f"[warmup] cold-start warm-up finished in {stats['total_ms']} ms "
+        f"(session_list={stats['session_list']['status']} "
+        f"{stats['session_list']['elapsed_ms']} ms)",
+        flush=True,
+    )
+    return stats

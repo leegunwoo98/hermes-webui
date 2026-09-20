@@ -689,6 +689,16 @@ def main() -> None:
     print(f'  Then open:     {scheme}://localhost:{PORT}', flush=True)
     print('', flush=True)
 
+    # Bounded, best-effort warm-up for the first sidebar load. Started only
+    # AFTER the socket is bound so it can never delay readiness; daemon thread;
+    # every failure is logged, never fatal. Kill switch:
+    # HERMES_WEBUI_NO_WARMUP=1.
+    try:
+        from api.startup import start_cold_start_warmup
+        start_cold_start_warmup()
+    except Exception as e:
+        print(f'[!!] WARNING: cold-start warm-up failed to start: {e}', flush=True)
+
     # ctl.sh stops the WebUI with SIGTERM. Python's default SIGTERM handler
     # terminates the process WITHOUT unwinding the try/finally around
     # serve_forever(), so drain_all_on_shutdown() (which flushes in-flight

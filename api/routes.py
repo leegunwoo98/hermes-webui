@@ -2023,6 +2023,98 @@ def _session_list_cache_key(
         archived_offset=archived_offset,
     ) + (bool(show_claude_code_sessions),)
 
+
+def _session_list_request_shape(parsed) -> dict:
+    """Parse the request-shape params of a ``/api/sessions`` request.
+
+    Single source for the request-shape half of the cache key. The route and the
+    startup warm-up both feed this into ``_session_list_cache_request_plan`` so a
+    warm-up key can never drift from the key a real request builds.
+    """
+    sidebar_source = parse_qs(parsed.query).get("sidebar_source", [""])[0].strip().lower() or None
+    if sidebar_source not in ("webui", "cli"):
+        sidebar_source = None
+    return {
+        "all_profiles": _all_profiles_enabled(parsed),
+        "include_archived": _query_flag(parsed, "include_archived"),
+        "exclude_hidden": _query_flag(parsed, "exclude_hidden"),
+        "archived_limit": _query_positive_int(parsed, "archived_limit", default=None, maximum=2000),
+        "archived_offset": _query_positive_int(parsed, "archived_offset", default=0, maximum=200000),
+        "sidebar_source": sidebar_source,
+    }
+
+
+def _session_list_cache_request_plan(settings: dict, *, all_profiles: bool,
+                                     include_archived: bool, exclude_hidden: bool,
+                                     archived_limit, archived_offset: int,
+                                     sidebar_source) -> tuple[tuple, dict]:
+    """Assemble the cache key AND the builder kwargs for ONE request shape.
+
+    The settings-derived flags, the active profile and the request shape together
+    determine the key. They are read in exactly one place so the route and the
+    startup warm-up cannot disagree about which cache slot a shape maps to (the
+    cache is capped at ``_SESSIONS_CACHE_MAX_ENTRIES`` with LRU eviction, so a
+    drifted key would warm a slot no request reads).
+    """
+    from api import profiles as profiles_api
+
+    active_profile = profiles_api.get_active_profile_name()
+    show_cli_sessions = bool(settings.get("show_cli_sessions"))
+    show_claude_code_sessions = bool(settings.get("show_claude_code_sessions"))
+    show_previous_messaging_sessions = bool(settings.get("show_previous_messaging_sessions"))
+    show_cron_sessions = bool(settings.get("show_cron_sessions"))
+    show_webhook_sessions = bool(settings.get("show_webhook_sessions"))
+    show_kanban_sessions = bool(settings.get("show_kanban_sessions"))
+    agent_session_source_filter = settings.get("agent_session_source_filter")
+    key = _session_list_cache_key(
+        active_profile=active_profile,
+        all_profiles=all_profiles,
+        show_cli_sessions=show_cli_sessions,
+        show_claude_code_sessions=show_claude_code_sessions,
+        show_previous_messaging_sessions=show_previous_messaging_sessions,
+        show_cron_sessions=show_cron_sessions,
+        include_archived=include_archived,
+        exclude_hidden=exclude_hidden,
+        visible_only=True,
+        show_webhook_sessions=show_webhook_sessions,
+        show_kanban_sessions=show_kanban_sessions,
+        source_filter=agent_session_source_filter,
+        sidebar_source=sidebar_source,
+        archived_limit=archived_limit,
+        archived_offset=archived_offset,
+    )
+    builder_kwargs = {
+        "active_profile": active_profile,
+        "all_profiles": all_profiles,
+        "show_cli_sessions": show_cli_sessions,
+        "show_claude_code_sessions": show_claude_code_sessions,
+        "show_previous_messaging_sessions": show_previous_messaging_sessions,
+        "show_cron_sessions": show_cron_sessions,
+        "include_archived": include_archived,
+        "exclude_hidden": exclude_hidden,
+        "visible_only": True,
+        "show_webhook_sessions": show_webhook_sessions,
+        "show_kanban_sessions": show_kanban_sessions,
+        "source_filter": agent_session_source_filter,
+        "sidebar_source": sidebar_source,
+        "archived_limit": archived_limit,
+        "archived_offset": archived_offset,
+    }
+    return key, builder_kwargs
+
+
+# The default /api/sessions shape the sidebar sends on first paint — mirrors
+# static/sessions.js `_sessionListQueryString()`: the webui source tab, no
+# project filter (so exclude_hidden=1), active profile only, no archived rows.
+_DEFAULT_SIDEBAR_REQUEST_SHAPE = {
+    "all_profiles": False,
+    "include_archived": False,
+    "exclude_hidden": True,
+    "archived_limit": None,
+    "archived_offset": 0,
+    "sidebar_source": "webui",
+}
+
 _ROUTE_SESSION_LIST_CACHE_DYNAMIC_EXPORTS = {
     "_SESSIONS_CACHE_ALL_PROFILES_INVALIDATION_VERSION",
     "_SESSIONS_CACHE_GLOBAL_INVALIDATION_VERSION",
@@ -2729,6 +2821,53 @@ def _hidden_archived_sidebar_reference_sessions(
     return references
 
 
+def _start_session_list_cache_background_rebuild(key: tuple, event, builder) -> None:
+    """Run ``builder`` off-thread for ``key`` and release the claim in every path.
+
+    ``event`` MUST be the event ``_session_list_cache_claim_rebuild(key)``
+    returned: ``_session_list_cache_done`` matches on event identity, so a
+    home-made ``threading.Event`` would leave the registered claim in place and
+    its waiters blocked. The thread is a daemon, and the claim is released in a
+    ``finally`` even when the builder raises.
+    """
+    def _rebuild():
+        try:
+            rebuild_attempts = 0
+            while True:
+                invalidation_stamp = _session_list_cache_invalidation_stamp(key)
+                try:
+                    payload = builder()
+                except Exception:
+                    logger.exception(
+                        "session list stale-cache background rebuild failed"
+                    )
+                    return
+                if (
+                    _session_list_cache_invalidation_stamp(key) == invalidation_stamp
+                    and _session_list_cache_set(
+                        key,
+                        payload,
+                        expected_invalidation_stamp=invalidation_stamp,
+                    )
+                ):
+                    return
+                rebuild_attempts += 1
+                if rebuild_attempts >= 3:
+                    return
+        finally:
+            _session_list_cache_done(key, event)
+
+    try:
+        thread = threading.Thread(
+            target=_rebuild,
+            name="session-list-cache-rebuild",
+            daemon=True,
+        )
+        thread.start()
+    except Exception:
+        _session_list_cache_done(key, event)
+
+
 def _get_cached_session_list_payload(
     *,
     key: tuple,
@@ -2760,43 +2899,7 @@ def _get_cached_session_list_payload(
                     diag.stage("session_list_cache_stale_background_rebuild")
                 except Exception:
                     pass
-
-            def _rebuild_stale_session_list_cache():
-                try:
-                    rebuild_attempts = 0
-                    while True:
-                        invalidation_stamp = _session_list_cache_invalidation_stamp(key)
-                        try:
-                            payload = builder()
-                        except Exception:
-                            logger.exception(
-                                "session list stale-cache background rebuild failed"
-                            )
-                            return
-                        if (
-                            _session_list_cache_invalidation_stamp(key) == invalidation_stamp
-                            and _session_list_cache_set(
-                                key,
-                                payload,
-                                expected_invalidation_stamp=invalidation_stamp,
-                            )
-                        ):
-                            return
-                        rebuild_attempts += 1
-                        if rebuild_attempts >= 3:
-                            return
-                finally:
-                    _session_list_cache_done(key, event)
-
-            try:
-                thread = threading.Thread(
-                    target=_rebuild_stale_session_list_cache,
-                    name="session-list-cache-rebuild",
-                    daemon=True,
-                )
-                thread.start()
-            except Exception:
-                _session_list_cache_done(key, event)
+            _start_session_list_cache_background_rebuild(key, event, builder)
         elif diag is not None:
             try:
                 diag.stage("session_list_cache_stale_return")
@@ -2888,6 +2991,44 @@ def _get_cached_session_list_payload(
             expected_invalidation_stamp=invalidation_stamp,
         )
     return payload
+
+
+def warm_default_session_list_cache(*, wait_timeout: float = 30.0) -> dict:
+    """Claim and drive ONE background rebuild for the sidebar's default shape.
+
+    Startup-only best-effort warm for the exact key the frontend's first
+    ``/api/sessions?sidebar_source=webui&exclude_hidden=1`` request reads. The
+    rebuild goes through the registered claim event
+    (``_session_list_cache_claim_rebuild`` → ``_start_session_list_cache_background_rebuild``)
+    so any concurrent waiter is released by the normal ``_session_list_cache_done``
+    path; an already-owned key is left to its owner.
+
+    Never raises: the returned stats dict carries the outcome for logging. The
+    builder writes what the request path already writes (the session index /
+    sidecars); it does not write state.db.
+    """
+    started = time.monotonic()
+    stats = {"owner": False, "completed": False, "elapsed_ms": 0, "key": None, "error": None}
+    try:
+        settings = load_settings()
+        key, builder_kwargs = _session_list_cache_request_plan(
+            settings, **_DEFAULT_SIDEBAR_REQUEST_SHAPE
+        )
+        stats["key"] = key
+        event, is_owner = _session_list_cache_claim_rebuild(key)
+        stats["owner"] = bool(is_owner)
+        if is_owner:
+            _start_session_list_cache_background_rebuild(
+                key,
+                event,
+                lambda: _build_session_list_cache_payload(**builder_kwargs),
+            )
+        stats["completed"] = bool(event.wait(wait_timeout))
+    except Exception as exc:
+        stats["error"] = f"{type(exc).__name__}: {exc}"
+    stats["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+    return stats
+
 
 from api.config import (
     STATE_DIR,
@@ -14180,46 +14321,15 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/sessions":
         diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
         try:
-            from api import profiles as profiles_api
-
             diag.stage("load_settings")
             settings = load_settings()
-            show_cli_sessions = bool(settings.get("show_cli_sessions"))
-            show_claude_code_sessions = bool(settings.get("show_claude_code_sessions"))
-            show_previous_messaging_sessions = bool(
-                settings.get("show_previous_messaging_sessions")
-            )
-            show_cron_sessions = bool(settings.get("show_cron_sessions"))
-            show_webhook_sessions = bool(settings.get("show_webhook_sessions"))
-            show_kanban_sessions = bool(settings.get("show_kanban_sessions"))
-            agent_session_source_filter = settings.get("agent_session_source_filter")
-            active_profile = profiles_api.get_active_profile_name()
-            all_profiles = _all_profiles_enabled(parsed)
-            include_archived = _query_flag(parsed, "include_archived")
-            exclude_hidden = _query_flag(parsed, "exclude_hidden")
-            archived_limit = _query_positive_int(parsed, "archived_limit", default=None, maximum=2000)
-            archived_offset = _query_positive_int(parsed, "archived_offset", default=0, maximum=200000)
-            sidebar_source = parse_qs(parsed.query).get("sidebar_source", [""])[0].strip().lower() or None
-            if sidebar_source not in ("webui", "cli"):
-                sidebar_source = None
             # /api/sessions is the default sidebar contract, so keep the route-owned
             # visible-row filter in the shared cache builder for both cache hits and misses.
-            key = _session_list_cache_key(
-                active_profile=active_profile,
-                all_profiles=all_profiles,
-                show_cli_sessions=show_cli_sessions,
-                show_claude_code_sessions=show_claude_code_sessions,
-                show_previous_messaging_sessions=show_previous_messaging_sessions,
-                show_cron_sessions=show_cron_sessions,
-                include_archived=include_archived,
-                exclude_hidden=exclude_hidden,
-                visible_only=True,
-                show_webhook_sessions=show_webhook_sessions,
-                show_kanban_sessions=show_kanban_sessions,
-                source_filter=agent_session_source_filter,
-                sidebar_source=sidebar_source,
-                archived_limit=archived_limit,
-                archived_offset=archived_offset,
+            # Key AND builder kwargs come from ONE assembly shared with the
+            # startup warm-up (warm_default_session_list_cache), so the warm-up
+            # can only ever fill the slot this route reads.
+            key, builder_kwargs = _session_list_cache_request_plan(
+                settings, **_session_list_request_shape(parsed)
             )
             # Keep the visible /api/sessions contract unchanged even though the
             # heavy lifting now lives in the cache builder: profile scoping via
@@ -14228,22 +14338,7 @@ def handle_get(handler, parsed) -> bool:
             payload = _get_cached_session_list_payload(
                 key=key,
                 builder=lambda: _build_session_list_cache_payload(
-                    active_profile=active_profile,
-                    all_profiles=all_profiles,
-                    show_cli_sessions=show_cli_sessions,
-                    show_claude_code_sessions=show_claude_code_sessions,
-                    show_previous_messaging_sessions=show_previous_messaging_sessions,
-                    show_cron_sessions=show_cron_sessions,
-                    include_archived=include_archived,
-                    exclude_hidden=exclude_hidden,
-                    visible_only=True,
-                    show_webhook_sessions=show_webhook_sessions,
-                    show_kanban_sessions=show_kanban_sessions,
-                    source_filter=agent_session_source_filter,
-                    sidebar_source=sidebar_source,
-                    archived_limit=archived_limit,
-                    archived_offset=archived_offset,
-                    diag=diag,
+                    diag=diag, **builder_kwargs
                 ),
                 diag=diag,
             )
