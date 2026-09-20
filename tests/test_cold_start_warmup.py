@@ -154,6 +154,43 @@ def test_start_cold_start_warmup_one_attempt_per_process(monkeypatch):
     assert startup.start_cold_start_warmup() is None, "second call must not start another attempt"
 
 
+# ── post-bind entry point (the one line server.py calls) ─────────────────────
+
+def test_start_after_bind_returns_the_started_thread(monkeypatch):
+    monkeypatch.delenv("HERMES_WEBUI_NO_WARMUP", raising=False)
+    monkeypatch.setattr(startup, "_warmup_started", False)
+    ran = threading.Event()
+    monkeypatch.setattr(startup, "_run_cold_start_warmup", lambda: ran.set())
+
+    thread = startup.start_cold_start_warmup_after_bind()
+    assert thread is not None, "the post-bind entry point must start the warm-up"
+    assert ran.wait(5), "warm-up thread did not run"
+    assert thread.daemon is True, "the warm-up must never keep the process alive"
+
+
+def test_start_after_bind_kill_switch_honored(monkeypatch):
+    monkeypatch.setenv("HERMES_WEBUI_NO_WARMUP", "1")
+    monkeypatch.setattr(startup, "_warmup_started", False)
+    started = []
+    monkeypatch.setattr(startup, "_run_cold_start_warmup", lambda: started.append(1))
+
+    assert startup.start_cold_start_warmup_after_bind() is None
+    assert started == [], "kill switch must not start the warm-up thread"
+
+
+def test_start_after_bind_logs_and_swallows_a_start_failure(monkeypatch, capsys):
+    """A failure to START the thread must not stop the server from serving."""
+    monkeypatch.setattr(
+        startup, "start_cold_start_warmup",
+        lambda: (_ for _ in ()).throw(RuntimeError("thread unavailable")),
+    )
+
+    assert startup.start_cold_start_warmup_after_bind() is None  # must not raise
+    out = capsys.readouterr().out
+    assert "cold-start warm-up failed to start" in out
+    assert "thread unavailable" in out
+
+
 # ── key identity: the warm-up must fill the slot the route reads ──────────────
 
 def test_warmup_default_shape_key_matches_the_route_key_for_the_sidebar_query():

@@ -166,6 +166,24 @@ def start_cold_start_warmup():
     return thread
 
 
+def start_cold_start_warmup_after_bind():
+    """Post-bind entry point for server.py: start the warm-up, never raise.
+
+    ``server.py`` calls this in ONE line after the socket has bound and before
+    ``serve_forever()`` (the wiring lives here so the thin routing shell stays
+    thin). Returns the warm-up thread, or None when the kill switch
+    (``HERMES_WEBUI_NO_WARMUP=1``) is set or an attempt already ran this process;
+    a failure to START the thread is logged, never raised, so startup always
+    proceeds to serve. The warm-up's own lifecycle is documented in
+    ARCHITECTURE.md ("Cold-start warm-up").
+    """
+    try:
+        return start_cold_start_warmup()
+    except Exception as e:
+        print(f'[!!] WARNING: cold-start warm-up failed to start: {e}', flush=True)
+        return None
+
+
 def _run_cold_start_warmup() -> dict:
     """Warm the first-paint caches once; returns per-component stats.
 

@@ -110,7 +110,7 @@ from api.helpers import (
 )
 from api.profiles import set_request_profile, clear_request_profile
 from api.routes import handle_delete, handle_get, handle_patch, handle_post, handle_put, apply_cors_preflight_headers
-from api.startup import auto_install_agent_deps, fix_credential_permissions
+from api.startup import auto_install_agent_deps, fix_credential_permissions, start_cold_start_warmup_after_bind
 from api.updates import WEBUI_VERSION
 from api.crash_visibility import install_crash_visibility
 
@@ -689,15 +689,7 @@ def main() -> None:
     print(f'  Then open:     {scheme}://localhost:{PORT}', flush=True)
     print('', flush=True)
 
-    # Bounded, best-effort warm-up for the first sidebar load. Started only
-    # AFTER the socket is bound so it can never delay readiness; daemon thread;
-    # every failure is logged, never fatal. Kill switch:
-    # HERMES_WEBUI_NO_WARMUP=1.
-    try:
-        from api.startup import start_cold_start_warmup
-        start_cold_start_warmup()
-    except Exception as e:
-        print(f'[!!] WARNING: cold-start warm-up failed to start: {e}', flush=True)
+    start_cold_start_warmup_after_bind()  # post-bind, best-effort; HERMES_WEBUI_NO_WARMUP=1 disables
 
     # ctl.sh stops the WebUI with SIGTERM. Python's default SIGTERM handler
     # terminates the process WITHOUT unwinding the try/finally around
